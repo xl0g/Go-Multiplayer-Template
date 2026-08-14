@@ -183,6 +183,31 @@ func (g *Game) updatePlaying(dt float64) error {
 				})
 			}
 		}
+		// Drain the debug panel's request queue. It builds whole messages itself,
+		// so nothing here needs to know what each one means.
+		if len(g.adminMenu.Out) > 0 {
+			if g.conn != nil {
+				for _, msg := range g.adminMenu.Out {
+					g.conn.SendJSON(msg)
+				}
+			}
+			g.adminMenu.Out = g.adminMenu.Out[:0]
+		}
+
+		// The debug panel is modal for the keyboard. Its shortcuts (B/K/V/P/G/H/
+		// T/S/F/E/M/R and the arrows) overlap gameplay keys, so returning here
+		// stops the game from also toggling the profile, mounting, swinging the
+		// sword or walking the player around while the panel is open.
+		if inpututil.IsKeyJustPressed(ebiten.KeyEscape) {
+			if g.adminMenu.HasFocus() {
+				g.adminMenu.blurAll() // first Esc leaves the text field
+			} else {
+				g.adminMenu.Close()
+			}
+		} else if inpututil.IsKeyJustPressed(ebiten.KeyTab) && !g.adminMenu.HasFocus() {
+			g.adminMenu.Close()
+		}
+		return nil
 	}
 
 	// Escape: close overlays in order.
@@ -226,10 +251,16 @@ func (g *Game) updatePlaying(dt float64) error {
 		g.adminMenu.Close()
 	}
 
-	// Tab key: toggle admin menu (admin only) — guard skipped intentionally so Tab can open the menu
-	if inpututil.IsKeyJustPressed(ebiten.KeyTab) && !g.chat.IsOpen && g.isAdmin && !g.uiHasFocus() {
-		g.adminMenu.Toggle()
-		g.inventoryMenu.Close()
+	// Tab key: toggle the admin / debug panel (admin accounts only).
+	if inpututil.IsKeyJustPressed(ebiten.KeyTab) && !g.chat.IsOpen && !g.uiHasFocus() {
+		if g.isAdmin {
+			g.adminMenu.Toggle()
+			g.inventoryMenu.Close()
+		} else {
+			// Say so rather than doing nothing: a silent no-op is indistinguishable
+			// from a broken key, and the fix (granting admin) is not guessable.
+			g.chat.AddMessage("", "Admin only. Grant it with: ./game-server -setadmin "+g.localName, true)
+		}
 	}
 
 	// ── Virtual button clicks (must be before handlePlayerClick) ──
@@ -408,12 +439,14 @@ func (g *Game) updatePlaying(dt float64) error {
 		}
 	}
 
-	// Nearest NPC (main map only) and world item
-	if g.currentMapName == "maps/GraalRebornMap.tmx" || g.currentMapName == "" {
-		g.nearNPCID, g.nearNPCType = g.nearestNPC()
-	} else {
-		g.nearNPCID, g.nearNPCType = "", -1
-	}
+	// Nearest NPC and world item.
+	//
+	// This used to be gated on currentMapName being the old default TMX map, which
+	// silently disabled talking to and mounting NPCs on every other map — and
+	// stayed disabled after returning from a building, since currentMapName keeps
+	// the interior's name. The server only ever sends NPCs on the player's own map
+	// instance, so no map check belongs here.
+	g.nearNPCID, g.nearNPCType = g.nearestNPC()
 	g.nearWorldItem = g.findNearWorldItem()
 
 	// Sword hit detection
@@ -869,6 +902,9 @@ func (g *Game) nearestNPC() (id string, npcType int) {
 	bestID := ""
 	bestType := -1
 	for nid, npc := range g.npcs {
+		if npc.RiddenBy != "" {
+			continue // someone is on it: not a thing you can walk up to
+		}
 		dx := npc.X + float64(frameW)/2 - px
 		dy := npc.Y + float64(frameH)/2 - py
 		d2 := dx*dx + dy*dy

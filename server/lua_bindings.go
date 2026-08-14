@@ -171,6 +171,38 @@ func (lm *LuaManager) registerBindings(r *Resource) {
 		return 0
 	}))
 
+	// SetNPCBehaviour(npcId, name)
+	// name ∈ "wander" | "roam" | "patrol" | "passive" | "aggressive" | "static".
+	// Unknown names fall back to "wander".
+	L.SetGlobal("SetNPCBehaviour", L.NewFunction(func(L *lua.LState) int {
+		id := L.CheckString(1)
+		name := L.CheckString(2)
+		L.Push(lua.LBool(lm.hub.setLuaNPCBehaviour(id, ParseBehaviour(name))))
+		return 1
+	}))
+
+	// SetNPCWaypoints(npcId, { {x=100,y=200}, {x=300,y=200}, ... })
+	// Installs a patrol route and switches the NPC to patrolling.
+	// An empty table reverts it to wandering.
+	L.SetGlobal("SetNPCWaypoints", L.NewFunction(func(L *lua.LState) int {
+		id := L.CheckString(1)
+		tbl := L.CheckTable(2)
+		var pts []vec2
+		tbl.ForEach(func(_, v lua.LValue) {
+			pt, ok := v.(*lua.LTable)
+			if !ok {
+				return
+			}
+			x, xok := pt.RawGetString("x").(lua.LNumber)
+			y, yok := pt.RawGetString("y").(lua.LNumber)
+			if xok && yok {
+				pts = append(pts, vec2{X: float64(x), Y: float64(y)})
+			}
+		})
+		L.Push(lua.LBool(lm.hub.setLuaNPCWaypoints(id, pts)))
+		return 1
+	}))
+
 	// GetNPCPosition(npcId) → x, y  (returns nil, nil if not found)
 	L.SetGlobal("GetNPCPosition", L.NewFunction(func(L *lua.LState) int {
 		id := L.CheckString(1)

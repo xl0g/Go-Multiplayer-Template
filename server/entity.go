@@ -18,8 +18,10 @@ type CombatEntity struct {
 }
 
 // newCombat creates a CombatEntity with full HP and alive=true.
+// MaxHP == 0 means immortal (see Damage) — such an entity is still alive,
+// otherwise it would be born dead and get filtered out of state broadcasts.
 func newCombat(maxHP int) CombatEntity {
-	return CombatEntity{HP: maxHP, MaxHP: maxHP, alive: maxHP > 0}
+	return CombatEntity{HP: maxHP, MaxHP: maxHP, alive: true}
 }
 
 // Damage applies dmg to the entity.

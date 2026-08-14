@@ -12,14 +12,23 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 # Build WASM client (placed in server/static/)
 ./build_web.sh
 
-# Run server (creates game.db automatically)
+# Run server — requires a reachable PostgreSQL; schema is migrated on startup
 ./game-server
-PORT=9090 DB_PATH=/tmp/game.db ./game-server
+PORT=9090 DATABASE_URL='postgres://user:pass@localhost:5432/graalreborn?sslmode=disable' ./game-server
+
+# Grant admin rights to an existing account, then exit
+./game-server -setadmin <username>
 
 # Run native client
 ./game-client
 ./game-client -server myserver.com:8080
+
+# Server tests (no database needed — they build a Hub directly)
+cd server && go test -race ./...
 ```
+
+The server must be run from the repository root: it resolves `config.json`,
+`maps/`, `assets/` and `server/static/` as relative paths.
 
 The client and server are **separate Go modules** (`go.mod` at root for client, `server/go.mod` for server). Run `go mod tidy` in each directory independently.
 
@@ -27,7 +36,10 @@ The client and server are **separate Go modules** (`go.mod` at root for client, 
 
 This is a real-time multiplayer game with two separate Go programs sharing a JSON-over-WebSocket protocol.
 
-### Client (root package `darkzone/MultiTest`)
+### Client (`client/`, package `main` in module `darkzone/MultiTest`)
+
+All client filenames below are relative to `client/`; the module root only holds
+`go.mod`, `config.json` and the build scripts.
 
 Built with [Ebiten](https://ebitengine.org/). Implements `ebiten.Game` in `game.go` as a **state machine** with states `StateMainMenu`, `StateLogin`, `StateRegister`, `StatePlaying`.
 
@@ -39,7 +51,24 @@ Key flow:
 
 **Platform split:** `network_native.go` (`!js` build tag) uses gorilla/websocket with goroutines; `network_js.go` (WASM) uses `syscall/js` browser WebSocket API. Both produce the same `*Connection` interface defined in `network.go`.
 
-**Client-side interpolation:** Remote entities (`Character.TargetX/Y`) are set from server state; display position (`Character.X/Y`) exponentially decays toward target each frame (`interpK = 20.0`). The local player skips interpolation and moves immediately.
+**Client-side interpolation:** Remote entities (`Character.TargetX/Y`) are set from server state; display position (`Character.X/Y`) exponentially decays toward target each frame (`interpK = 20.0`). The local player skips interpolation and moves immediately. All of this lives in `Character.applyRemoteMotion`, split out so it can be tested without sprites or images (`client/interp_test.go`).
+
+Two rules that both caused visible teleporting when broken:
+
+- **Dead reckoning uses the server-measured velocity** (`PlayerState.VX/VY`,
+  `NPCState.VX/VY`), never a velocity inferred from the facing direction.
+  Inference cannot be right: diagonal movement has two components but one facing,
+  NPC speeds are randomised per NPC, and an entity steering around an obstacle
+  faces where it wants to go. Every mismatch became a visible correction on the
+  next snapshot. Single-tick jumps above `maxTickStep` are reported as zero
+  velocity so real teleports do not make clients predict off-world.
+- **Predicted positions clamp against `activeWorldW/H`**, the size of the world
+  actually loaded, refreshed every frame from `Game.worldSize()`. Using the
+  compile-time `worldW`/`worldH` constants (1120 px) clamped every remote entity
+  on a larger world back to ~1088 px each frame, tripping the `remoteSnapDist`
+  snap and flickering sprites between their real position and the world corner.
+  Refreshing every frame matters: in GMAP mode the real size only arrives after
+  the metadata request completes.
 
 **Cosmetics:** Body/head/hat images are loaded asynchronously in goroutines when filenames change (`SetCosmetics` → sets `cosDirty` → goroutine loads from `Assets/offline/levels/`). Cosmetic state is protected by `Character.cosmu` mutex.
 
@@ -49,13 +78,168 @@ Sprite sheet layout: body frames are 32×32 px, arranged as `[col=direction][row
 
 ### Server (`server/` package `darkzone/MultiTestServer`)
 
-Single-file server (`server/server.go`) combining:
-- **SQLite** (via `modernc.org/sqlite`, CGo-free) — tables: `users`, `sessions`, `chat_history`
+Split across several files (`server/server.go` is an empty placeholder that only
+documents the split):
+
+| File | Responsibility |
+|------|----------------|
+| `main.go` | entry point, route table, `-setadmin` |
+| `hub.go` | `Hub` — client registry, 60 Hz game loop, per-client state broadcast |
+| `client.go` | WebSocket lifecycle and every `C → S` message handler |
+| `npc.go` | `NPC`, AI (wander / aggressive / passive), dialog defs, built-in NPC table |
+| `entity.go` | `CombatEntity` — HP, damage, invulnerability, respawn (shared by NPCs *and* players) |
+| `spatial.go` | `tempGrid` interest-management grid, `viewRadius` |
+| `gralat.go` | gralat spawn offsets, `findFreePos` |
+| `items.go` / `handlers.go` | item defs; HTTP register/login/asset listing |
+| `map_handler.go`, `tmx_parser.go`, `nw_format.go`, `world_collision.go` | map/chunk API and collision loading |
+| `lua_manager.go`, `lua_bindings.go` | Lua resource system (`resources/*/`) |
+| `internal/db/` | PostgreSQL layer (`pgx`) |
+
+- **PostgreSQL** (via `github.com/jackc/pgx/v5`) — `DATABASE_URL`, default
+  `postgres://postgres:postgres@localhost:5432/graalreborn`. `db.migrate()` runs
+  `CREATE TABLE IF NOT EXISTS` + idempotent `ALTER TABLE ... ADD COLUMN IF NOT
+  EXISTS` on every startup, so adding a column means adding a line there.
+  Tables: `users`, `sessions`, `chat_history`, `inventory`, `world_items`,
+  `friends`, `guilds`, `quests`.
 - **HTTP REST** — `POST /api/register`, `POST /api/login` return a session token
-- **WebSocket hub** — `Hub` manages connected `Client`s under an `sync.RWMutex`
-- **Game loop** — `Hub.runGameLoop()` ticks at 60 Hz, updates NPC AI, broadcasts full world state to all clients
-- **NPC AI** — 7 hard-coded NPCs wander randomly within a radius around their home position
+- **WebSocket hub** — `Hub` manages connected `Client`s under a single `sync.RWMutex`
+  that guards `clients`, every `Client.state`/`currentMap`, and every `NPC`
+- **Game loop** — `Hub.runGameLoop()` ticks at 60 Hz: **player combat ticks and
+  velocity measurement**, NPC AI, alert propagation, NPC attacks, Lua timers,
+  gralat respawns, then `sendPerClientState()`.
+  Players share `CombatEntity` with NPCs, so their `hitCD` must be ticked here —
+  miss it and a player's invulnerability window never expires, making them
+  permanently immune after the first hit they ever take.
+- **NPC AI** — 15 built-in NPCs (`builtinNPCDefs`) plus Lua- and admin-spawned
+  ones. See the behaviour section below.
 - **Map chunk API** — serves `.gmap` metadata and NW chunk data (layers, NPCs, signs, warp links) for the GMAP chunk streaming system
+
+**Interest management:** `sendPerClientState()` sends each client its own
+filtered snapshot rather than broadcasting the whole world — same map instance,
+then within `viewRadius` (2048 px) using the per-tick spatial grid.
+
+### NPC behaviours (`npc.go`)
+
+`NPCType` decides how an NPC looks and what it says; **`Behaviour` decides how it
+moves**. They are separate on purpose — a merchant can patrol and a guard can
+stand still without inventing a type for each combination. `defaultBehaviourFor`
+supplies the historical type→behaviour mapping when none is given.
+
+| Behaviour | Movement |
+|-----------|----------|
+| `BehaviourWander` | short random walk around home (default) |
+| `BehaviourRoam` | wide random walk (`roamRadius`), rarely idle |
+| `BehaviourPatrol` | walks a waypoint loop, pausing at each stop |
+| `BehaviourPassive` | flees the nearest player |
+| `BehaviourAggressive` | chases and attacks |
+| `BehaviourStatic` | never moves |
+
+On top of the behaviour sits a small state machine (`aiState`): `aiNormal` →
+`aiChasing` → `aiReturning` → `aiNormal`. Anything can be pulled into a chase;
+when the chase ends the NPC walks home rather than settling wherever it stopped.
+
+- **Leash** (`aggroLeashRange`, or `NPC.leashRange`) caps how far an NPC may be
+  dragged from home before it gives up. Without it a player can pull a monster
+  across the world and abandon it there.
+- **Who fights**: `NPC.canFight` gates every route into combat. Only guards and
+  monsters qualify — villagers, animals and horses never chase, no matter what
+  happens around them. `NPC.alertGroup` then scopes alerts to one side (monsters
+  rally monsters, guards rally guards, bystanders answer nobody), so a monster
+  shouting cannot recruit the town guard against the player. A guard still fights
+  back when the player hits it directly, via `provoke`.
+- **Alerting**: entering a chase, or taking a hit (`NPC.provoke`), raises an
+  alert. `Hub.propagateAlerts` pulls in eligible allies within `alertRadius` on
+  the same map. `alertCooldown` stops a long fight from re-alerting every tick.
+  `raisedAlert` is set either by the AI tick or by `damageNPC` between ticks, and
+  `propagateAlerts` is the only place that clears it — do not clear it in
+  `NPC.update`.
+- **Attacking** sets `NPC.attackAnim`, which `syncState` turns into the `sword`
+  anim state so the swing is visible; the server also sends the attacker's name
+  and position in `pvp_damage` so the client can show the damage number and knock
+  the player away from the right place.
+- **Passive flee** uses two thresholds (`passiveFleeRange` to start,
+  `passiveFleeStop` to stop). One threshold made animals oscillate between
+  fleeing and wandering at the boundary, which read as flickering. Fleeing goes
+  through `moveDir` (a direction) not `moveToward` (a destination): a flee target
+  computed from the animal's own position recedes as it moves, so the stall
+  detector never sees progress and shakes the animal in place.
+
+**Obstacle avoidance.** Every step goes through `NPC.stepWithSteering`, which
+tries the direct heading first and then increasing deflections (`steerOffsets`)
+until one is clear. Two rules keep it from degenerating:
+
+- **Exhaust one side before trying the other.** The committed side
+  (`NPC.steerSide`) is tried at *every* offset before the mirror side is
+  considered at all. Interleaving the sides per offset looks natural but makes an
+  NPC walking down the face of an obstacle switch to walking up the moment the
+  downward angle it needs exceeds the upward angle available — it then slides up
+  and down forever instead of rounding the obstacle.
+- **Face where you actually moved**, not where you wanted to, or the sprite walks
+  sideways.
+
+Measured on a wall blocking a straight 800 px path, the detour costs ~13% extra
+distance. This replaced a "push straight, nudge sideways when blocked" scheme
+that made NPCs shuffle against obstacles until they happened to slip past.
+
+Dynamic obstacles (world items) are layered on the static map collision by
+`obstacleCollider`, built per map each tick by `Hub.colliderResolver` — which
+allocates nothing in the common case of no world items.
+
+**Movement invariant — `moveToward` and progress.** All movement goes through
+`NPC.moveToward`, which counts progress as *getting closer to the destination
+than the NPC has ever been* (`bestDist`), not as "a collision test passed" and
+not as "the position changed". Both weaker definitions silently freeze NPCs:
+
+- with an axis-aligned destination (`dy == 0`, which every `squarePatrol` leg is)
+  the candidate Y equals the current Y, so the Y collision test passes on the
+  position the NPC already occupies;
+- while unsticking, the sideways detour changes the position without getting any
+  nearer, and oscillating along a wall repeatedly re-approaches the target.
+
+Either one resets the stall timers every tick, so no behaviour ever gives up on
+an unreachable destination and the NPC stands still forever while reporting
+`Moving = true`. `blockedTime` accumulates only while there is no new best, and
+each behaviour uses it to re-target (`blockedRetarget*`). Spawn placement has the
+matching rule: use `Hub.freeBoxNear`, which validates the **whole 28×28 box**
+(`npcW`/`npcH`), not a single point — a point-validated spawn can leave an NPC
+embedded in a wall.
+
+### Map instances (read this before touching any interaction handler)
+
+Every player and NPC belongs to a **map instance**, identified by a map name:
+`Client.currentMap` (set by the `change_map` message) and `NPC.mapID`. Entities
+on different instances must never see or affect each other.
+
+Rules that are easy to break:
+
+1. **Never compare map IDs directly.** An empty string means "the default map",
+   so always normalize through `mapOrDefault()`. Comparing `""` with
+   `defaultMap` silently creates two instances out of one.
+2. **`defaultMap` is a `var`, not a constant.** It is derived from
+   `config.json` at startup by `resolveDefaultMap()`, which mirrors the client's
+   own map naming (`Game.activeGMap` in GMAP mode, `Game.currentMapName` in TMX
+   mode). If it stops matching what the client announces, every entity with an
+   empty `mapID` lands on an instance no player is ever on: the world goes
+   silently empty with no error anywhere.
+3. **Coordinate spaces repeat across maps**, so a proximity check alone proves
+   nothing — a player on one map is "next to" an entity at the same coordinates
+   on every other map. Any handler resolving a target by ID must scope it to the
+   actor's map: use `Hub.findNPCOnMap(id, mapID)` for NPCs, and compare
+   `mapOrDefault(other.currentMap)` for players. This applies to `talk_npc`,
+   `sword_hit`, `pvp_hit`, `mount_npc`, `collect_gralat` and `buy_world_item`.
+4. **Client-supplied coordinates are never trusted alone.** `collect_gralat` and
+   the combat handlers validate distance server-side (`gralatReach`, `maxReach`).
+5. **Built-in content is positioned relative to the spawn point**
+   (`builtinNPCDefs`, `gralatSpawnDefs` hold `dx/dy` offsets resolved by
+   `Hub.placeNear`). Never reintroduce absolute world coordinates: they only ever
+   make sense for one map size.
+
+`server/instance_test.go` covers these rules and runs without a database.
+
+**Immortality convention:** `CombatEntity.MaxHP == 0` means *immortal* (horses),
+not *dead* — `Damage()` returns `-1` for such entities and `newCombat` keeps them
+`alive`. An immortal entity that is marked dead disappears from every broadcast,
+is never ticked, and cannot be interacted with.
 
 WebSocket lifecycle: first message must be `{"type":"auth","token":"..."}` within 10 s, then the client is registered in the hub. A writer goroutine drains `client.send` and sends WebSocket pings every 54 s. Read deadline resets on each message or pong.
 
@@ -66,23 +250,37 @@ The server also serves `server/static/` as the web root (WASM client after `./bu
 | Direction | `type` | Key fields |
 |-----------|--------|------------|
 | C → S | `auth` | `token` |
-| C → S | `move` | `x`, `y`, `dir`, `moving`, `mounted` |
-| C → S | `chat` | `msg` |
-| C → S | `cosmetic` | `body`, `head`, `hat` (filenames) |
-| C → S | `collect_gralat` | `id` |
-| C → S | `talk_npc` | `id` |
-| C → S | `mount_npc` | `id` |
+| C → S | `move` | `x`, `y`, `dir`, `moving`, `anim`, `mounted` |
+| C → S | `change_map` | `map` — announces the client's map instance |
+| C → S | `chat` | `msg` (also carries `/`-commands, see below) |
+| C → S | `cosmetic` | `body`, `head`, `hat`, `shield`, `sword` (filenames) |
+| C → S | `collect_gralat` | `gralat_id` |
+| C → S | `talk_npc` | `npc_id` |
+| C → S | `mount_npc` | `npc_id` |
 | C → S | `dismount` | — |
-| C → S | `sword_hit` | target player/NPC id |
+| C → S | `anim_state` | `anim`, `mounted` (also drives client-side respawn) |
+| C → S | `sword_hit` | `npc_id` |
+| C → S | `pvp_hit` | `target_id` |
+| C → S | `use_item` | `item_id` |
+| C → S | `buy_world_item` | `id` |
 | C → S | `admin_spawn_world_item` | `name`, `sprite`, `item_id`, `price`, `x`, `y` |
 | C → S | `admin_remove_world_item` | `id` |
-| S → C | `auth_ok` | `id`, `name`, `x`, `y` |
+| C → S | `friend_add` / `friend_accept` / `friend_remove` | `target` / `from` / `target` |
+| C → S | `friend_list` / `guild_info` / `guild_list` / `quest_list` | — |
+| C → S | `guild_create` | `name`, `tag`, `description` |
+| C → S | `guild_join` / `guild_leave` | `guild_id` / — |
+| C → S | `quest_start` | `quest_id` |
+| S → C | `auth_ok` | `id`, `name`, `x`, `y`, `map`, `gralat_n`, `playtime`, cosmetics, `is_admin` |
 | S → C | `auth_error` | `msg` |
 | S → C | `state` | `players[]`, `npcs[]`, `gralats[]`, `worldItems[]` (60 Hz) |
 | S → C | `chat` | `from`, `msg` |
 | S → C | `system` | `msg` |
-| S → C | `gralat_update` | `gralats` |
-| S → C | `npc_dialog` | `npc_id`, `text` |
+| S → C | `gralat_update` | `gralat_n` (the player's new total) |
+| S → C | `npc_dialog` | `msg`, `gralat_n` |
+| S → C | `npc_damage` | `npc_id`, `hp`, `killed` |
+| S → C | `pvp_damage` | `from`, `damage`, `atk_x`, `atk_y`, `hp`, `killed` |
+| S → C | `mount_ok` / `dismount_ok` | `npc_id` / — |
+| S → C | `buy_result` | `success`, `msg`, `gralat_n`, `item_id` |
 | S → C | `friend_list` | `friends[]`, `requests[]` |
 | S → C | `friend_request` | `from` |
 | S → C | `friend_result` | `msg` |
@@ -92,6 +290,42 @@ The server also serves `server/static/` as the web root (WASM client after `./bu
 | S → C | `quest_list` | `quests[]` |
 | S → C | `quest_update` | `quest_id`, `progress` |
 | S → C | `inventory` | `items[]` |
+
+### Chat Commands (server-side, handled in `handleChat`)
+
+Messages starting with `/` are intercepted and never broadcast as chat:
+
+| Command | Access | Effect |
+|---------|--------|--------|
+| `/itemlist` | all | lists known item IDs |
+| `/giveitem <player> <item_id>` / `/removeitem <player> <item_id>` | admin | inventory edits, refreshed live if the target is online |
+| `/spawnenemy [name]` | admin | spawns an aggressive NPC on the caller's map |
+| `/resources` | admin | lists running Lua resources |
+| `/start` / `/stop` / `/restart <resource>` | admin | Lua resource control |
+
+Admin rights come from `users.is_admin`, set with `./game-server -setadmin <user>`.
+
+### Lua Resources (`resources/<name>/`)
+
+`LuaManager` loads each resource directory and runs its scripts in isolated
+states. Script selection order: `__resource.lua` manifest (`server_scripts`) →
+`server.lua` → all `*.lua` sorted. `LuaManager.Tick()` is driven by the game loop
+and runs timers plus queued events.
+
+Bindings (`lua_bindings.go`):
+
+- NPCs — `CreateNPC`, `DeleteNPC`, `SetNPCPosition`, `GetNPCPosition`,
+  `SetNPCDialog`, `SetNPCBehaviour(id, "wander"|"roam"|"patrol"|"passive"|"aggressive"|"static")`,
+  `SetNPCWaypoints(id, {{x=..,y=..}, ...})`
+- Players — `GetPlayers`, `GetPlayerName`, `GetPlayerPos`, `GiveGralats`, `TakeGralats`
+- Messaging — `SendMessage`, `BroadcastMessage`, `BroadcastChat`
+- Timers — `SetTimeout`, `SetInterval`, `ClearTimer`
+- Events — `AddEventHandler`, `TriggerEvent`; the server fires
+  `onPlayerConnect`, `onPlayerDisconnect`, `onPlayerChat`
+- Misc — `RandomInt`, `GetResourceName`
+
+NPCs created from Lua adopt the hub's world bounds and land on the **default map
+instance** unless their `mapID` is set.
 
 ### Config System (`config.go` / `config.json`)
 
@@ -146,7 +380,10 @@ Full parser and player for the `.gani` format (Graal Online animations). Key det
 
 - `R` key: mount the nearest rideable NPC → sends `mount_npc`; dismounts with another `R` → sends `dismount`.
 - While mounted, `Character.Mounted = true`; speed uses `Cfg.MountedSpeed`; the `ride` gani plays.
-- Server broadcasts mount state in `PlayerState`.
+- Server broadcasts mount state in `PlayerState`, and mirrors the rider's position onto the horse via `Hub.updateHorsePos` on every `move`.
+- Only `NPCTypeHorse` NPCs are rideable, and only one rider at a time
+  (`NPC.mountedBy`). `Hub.unregister` frees the horse when a rider disconnects.
+- Horses are immortal (`MaxHP == 0`) — see the immortality convention above.
 
 ### Sword & Grab
 
@@ -156,7 +393,7 @@ Full parser and player for the `.gani` format (Graal Online animations). Key det
 
 ### Gralat Currency System
 
-`GralatPickup` is defined in `types.go` (client) and inline in `server/server.go`. The server owns the authoritative list of world pickups, broadcasting them inside every `state` message. The client auto-collects on overlap and sends `collect_gralat`; the server validates, removes, credits the DB, and sends back `gralat_update`. NPCs give gralats via `talk_npc` → `npc_dialog` (120 s cooldown per NPC per player). Gralats persist in the `users.gralats` DB column. Each player's count is included in `PlayerState` and displayed in the HUD (top-centre) and the profile panel (`P` key). Other players can see the count in name tags.
+`GralatPickup` is defined in `types.go` on both sides. The server owns the authoritative list of world pickups, sending the ones on the player's own map inside every `state` message. The client auto-collects on overlap and sends `collect_gralat`; the server validates **map instance and distance** (`gralatReach`) before removing it, crediting the DB and replying `gralat_update`. NPCs give gralats via `talk_npc` → `npc_dialog` (120 s cooldown per NPC per player). Gralats persist in the `users.gralats` DB column. Each player's count is included in `PlayerState` and displayed in the HUD (top-centre) and the profile panel (`P` key). Other players can see the count in name tags.
 
 Sprite sheet `Assets/offline/levels/images/downloads/gralats.png` is 64×64 (2×2 grid of 32×32): top-left=1, top-right=5, bottom-left=30, bottom-right=100. Loading and sprite selection is in `gralat.go`.
 
@@ -173,13 +410,36 @@ Sprite sheet `Assets/offline/levels/images/downloads/gralats.png` is 64×64 (2×
 
 `PanelMenu` is the icon strip at the top of screen (Maps, News, Shop, Friends, Guilds, Quests, Settings…). Clicking an icon opens the corresponding sub-panel or action.
 
-### Admin Menu (`admin.go`)
+### Admin / Debug Panel (`client/admin.go` + `server/admin_debug.go`)
 
-Accessible via `Tab` key for admin accounts only (`g.isAdmin`). Lets admins:
-- Spawn world items (name, sprite path, item id, price) at the local player's position.
-- Remove existing world items by id (shown in a list synced from server).
+`Tab` opens a four-tab panel for admins (`users.is_admin`). It is **modal for the
+keyboard**: `game_input.go` returns early while it is open, because its shortcuts
+overlap gameplay keys (P, F, R, T, …) and the arrows would otherwise walk the
+player. `Esc` first leaves a focused text field, then closes.
 
-Signals `SpawnReq` / `RemoveID` are set on the struct and consumed by `game.go` each frame.
+| Tab | Contents |
+|-----|----------|
+| `1 SERVER` | map instance (own vs default), world size, spawn anchor, collision loaded, observed game-loop Hz, uptime, entity counts, running Lua resources |
+| `2 NPCS` | every NPC on your map with behaviour, AI state, HP, distance and `blocked` timer; `↑↓` select, `B` cycle behaviour, `K` kill, `V` revive, `P` provoke, `G` bring here, `H` send home, `T` teleport to it |
+| `3 PLAYER` | teleport by coordinates or to spawn, kill / full heal, give or remove gralats, spawn 1 or 5 aggressive enemies |
+| `4 ITEMS` | the world-item spawn form and the list of items on your map |
+
+The panel queues whole messages in `AdminMenu.Out`, which `game_input.go` drains
+and sends — the menu never touches the connection. Server handlers all start with
+`requireAdmin`. Two fields worth knowing when reading the NPCS tab: `AI` shows the
+`aiState` (`normal` / `chasing` / `returning`) and `BLK` is `blockedTime`, which
+turns orange past 1 s and means the NPC cannot reach its destination.
+
+Protocol (all admin-gated): C→S `admin_debug_info`, `admin_npc_list`,
+`admin_npc_behaviour`, `admin_npc_action` (`kill`/`revive`/`provoke`/`bring`/`home`),
+`admin_teleport`, `admin_gralats`, `admin_set_hp`, `admin_spawn_enemy`;
+S→C `debug_info`, `npc_debug_list` (keyed `debugNpcs`, **not** `npcs`, which
+already carries `[]NPCState`), `teleport_ok`.
+
+World items still use the older signal pattern rather than the `Out` queue:
+`SpawnReq` / `RemoveID` are set on the struct and consumed by `game_input.go`,
+because the spawn position has to be filled in from `localChar` before sending.
+Items spawn on the admin's **current map**, persisted in `world_items.map_name`.
 
 ### Emoji / Emoticons (`emoji.go`)
 
@@ -211,7 +471,7 @@ When a player sends chat text matching a shortcode (`:)`, `:(`, etc.) an emotico
 | `P` | Toggle profile panel (gralat count) |
 | `T` | Open chat |
 | `C` | Open cosmetic picker |
-| `Tab` | Toggle admin menu (admin only) |
+| `Tab` | Toggle admin / debug panel (admin only; modal for the keyboard) |
 | `F3` | Toggle debug overlay |
 | Mouse wheel | Camera zoom in/out |
 | `Esc` | Close dialog / close panel / back to menu |

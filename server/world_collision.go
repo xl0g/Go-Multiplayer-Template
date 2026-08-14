@@ -11,17 +11,64 @@ import (
 
 // serverConfig mirrors the client-side config.json fields the server cares about.
 type serverConfig struct {
-	SpawnMap string `json:"spawnMap"`
+	SpawnMap string  `json:"spawnMap"`
+	SpawnX   float64 `json:"spawnX"`
+	SpawnY   float64 `json:"spawnY"`
+}
+
+// loadServerConfig reads config.json, falling back to compiled-in defaults.
+func loadServerConfig(configPath string) serverConfig {
+	cfg := serverConfig{SpawnMap: "maps/GraalRebornMap.tmx"}
+	if data, err := os.ReadFile(configPath); err == nil {
+		_ = json.Unmarshal(data, &cfg)
+	}
+	return cfg
+}
+
+// resolveDefaultMap derives the default map ID from config.json, using exactly
+// the same naming the client announces in its change_map messages
+// (Game.activeGMap for GMAP mode, Game.currentMapName for TMX mode).
+//
+// This has to agree with the client. The server groups every entity with an
+// empty mapID onto this ID, so if it disagrees, all built-in NPCs, gralats and
+// world items end up on a map instance no player is ever on — invisible and
+// unreachable, while the game otherwise looks healthy.
+func resolveDefaultMap(configPath string) string {
+	const fallback = "maps/GraalRebornMap.tmx"
+	cfg := loadServerConfig(configPath)
+	name := strings.TrimSpace(cfg.SpawnMap)
+	if name == "" {
+		return fallback
+	}
+
+	// GMAP mode: the client keeps the configured name as-is (appending .gmap if
+	// absent) and announces that.
+	if strings.HasSuffix(strings.ToLower(name), ".gmap") {
+		return name
+	}
+
+	// TMX mode: mirror the client's loadMap() resolution — normalize the suffix,
+	// then probe maps/tmx/ before maps/ for bare filenames.
+	lower := strings.ToLower(name)
+	if strings.HasSuffix(lower, ".nw") {
+		name = name[:len(name)-3] + ".tmx"
+	} else if !strings.HasSuffix(lower, ".tmx") {
+		name += ".tmx"
+	}
+	if !strings.Contains(name, "/") {
+		primary := filepath.Join("maps", "tmx", name)
+		if st, err := os.Stat(primary); err == nil && !st.IsDir() {
+			return primary
+		}
+		return filepath.Join("maps", name)
+	}
+	return name
 }
 
 // loadWorldCollider reads config.json to determine the spawn map type,
 // then returns the appropriate WorldCollider (GMapWorld or CollisionMap).
 func loadWorldCollider(configPath string) WorldCollider {
-	cfg := serverConfig{SpawnMap: "maps/GraalRebornMap.tmx"}
-	if data, err := os.ReadFile(configPath); err == nil {
-		_ = json.Unmarshal(data, &cfg)
-	}
-
+	cfg := loadServerConfig(configPath)
 	spawnMap := cfg.SpawnMap
 	lower := strings.ToLower(spawnMap)
 
@@ -193,4 +240,64 @@ func (w *GMapWorld) IsBlocked(x, y, bw, bh float64) bool {
 		w.isPointSolid(x+bw-margin, y+margin) ||
 		w.isPointSolid(x+margin, y+bh-margin) ||
 		w.isPointSolid(x+bw-margin, y+bh-margin)
+}
+
+// ── Dynamic obstacles ─────────────────────────────────────────────────────────
+
+// aabb is an axis-aligned box in world pixels.
+type aabb struct{ x, y, w, h float64 }
+
+func (a aabb) overlaps(x, y, w, h float64) bool {
+	return x < a.x+a.w && x+w > a.x && y < a.y+a.h && y+h > a.y
+}
+
+func (a aabb) contains(x, y float64) bool {
+	return x >= a.x && x < a.x+a.w && y >= a.y && y < a.y+a.h
+}
+
+// worldItemBox is the collision footprint of a world item. Item sprites vary in
+// size and the server never loads them, so this is a deliberate approximation
+// sized to the tile grid rather than to any particular sprite.
+const (
+	worldItemBox   = 24.0
+	worldItemInset = 4.0
+)
+
+// obstacleCollider layers dynamic obstacles on top of the static world
+// collision, so NPC AI treats world items as solid instead of walking through
+// them. A nil base means "no static collision", not "everything is blocked".
+type obstacleCollider struct {
+	base      WorldCollider
+	obstacles []aabb
+}
+
+func (o *obstacleCollider) IsBlocked(x, y, w, h float64) bool {
+	if o.base != nil && o.base.IsBlocked(x, y, w, h) {
+		return true
+	}
+	for _, ob := range o.obstacles {
+		if ob.overlaps(x, y, w, h) {
+			return true
+		}
+	}
+	return false
+}
+
+func (o *obstacleCollider) IsFreePoint(x, y float64) bool {
+	if o.base != nil && !o.base.IsFreePoint(x, y) {
+		return false
+	}
+	for _, ob := range o.obstacles {
+		if ob.contains(x, y) {
+			return false
+		}
+	}
+	return true
+}
+
+func (o *obstacleCollider) Bounds() (float64, float64) {
+	if o.base != nil {
+		return o.base.Bounds()
+	}
+	return mapWidth, mapHeight
 }

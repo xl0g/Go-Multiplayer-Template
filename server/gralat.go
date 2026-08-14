@@ -8,21 +8,29 @@ import (
 // respawnDelay is how long after collection before a gralat reappears.
 const respawnDelay = 45 * time.Second
 
-// gralatSpawnDefs defines the fixed world positions and values of gralat pickups.
-// Positions are in pixels for the 1120×1120 world (70×70 tiles at 16 px each).
+// gralatReach is how far a player may be from a pickup and still collect it.
+// Generous enough to absorb client interpolation and latency, tight enough that
+// a client cannot claim coins it never walked over.
+const gralatReach = 64.0
+
+// gralatSpawnDefs defines the values of the gralat pickups and where they sit
+// relative to the configured spawn point (Hub.spawnX/spawnY), in pixels.
+// Offsets rather than absolute coordinates: the previous absolute values were
+// authored for the 1120×1120 TMX world and put every coin tens of thousands of
+// pixels away from spawn on any larger map.
 var gralatSpawnDefs = []struct {
-	id    string
-	x, y  float64
-	value int
+	id     string
+	dx, dy float64
+	value  int
 }{
-	{"g0", 160, 200, 1},
-	{"g1", 560, 240, 5},
-	{"g2", 900, 300, 1},
-	{"g3", 250, 600, 30},
-	{"g4", 720, 500, 5},
-	{"g5", 1000, 180, 1},
-	{"g6", 400, 800, 100},
-	{"g7", 650, 750, 5},
+	{"g0", -320, -120, 1},
+	{"g1", 80, -80, 5},
+	{"g2", 420, -20, 1},
+	{"g3", -230, 280, 30},
+	{"g4", 240, 180, 5},
+	{"g5", 520, -140, 1},
+	{"g6", -80, 480, 100},
+	{"g7", 170, 430, 5},
 }
 
 // findFreePos searches outward from (x,y) in a spiral for a non-blocked tile.

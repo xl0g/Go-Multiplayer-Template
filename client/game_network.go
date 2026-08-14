@@ -3,44 +3,17 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 )
 
-// remoteVel returns the dead-reckoning velocity (px/s) for a remote entity
-// based on its current direction and moving flag.
-// This is used to predict where the entity will be between server snapshots,
-// compensating for the one-way network latency.
-func remoteVel(dir int, moving bool, speed float64) (vx, vy float64) {
-	if !moving {
-		return 0, 0
-	}
-	switch dir {
-	case 0: // up
-		return 0, -speed
-	case 1: // left
-		return -speed, 0
-	case 2: // down
-		return 0, speed
-	case 3: // right
-		return speed, 0
-	}
-	return 0, 0
-}
-
-// npcDeadReckonSpeed returns the dead-reckoning speed for an NPC type.
-// Chasing NPCs (aggressive/spawned) move diagonally toward the player, so
-// cardinal-direction dead-reckoning would overshoot — they use 0 (pure
-// interpolation toward the last known position instead).
-func npcDeadReckonSpeed(npcType int) float64 {
-	switch npcType {
-	case NPCTypeSpawnedEnemy, NPCTypeAggressive:
-		return 0 // pure interpolation: no cardinal-direction prediction
-	case NPCTypePassive:
-		return 120.0
-	default:
-		return 95.0
-	}
-}
+// Dead reckoning uses the velocity the server measured for each entity
+// (PlayerState.VX/VY, NPCState.VX/VY) rather than inferring one from the facing
+// direction. Inference could not be right: diagonal movement has two non-zero
+// components but only one facing, NPC speeds are randomised per NPC, and an
+// entity steering around an obstacle faces where it wants to go rather than
+// where it is going. Every mismatch showed up as a visible correction on the
+// next snapshot.
 
 // ──────────────────────────────────────────────────────────────
 // Network message processing
@@ -72,6 +45,16 @@ func (g *Game) handleServerMsg(data []byte) {
 		g.localPlaytime = msg.Playtime
 		g.isAdmin = msg.IsAdmin
 		g.sessionStart = time.Now()
+		// Restore the map instance the player logged out on. The stored X/Y are
+		// only meaningful on that map, so this must happen before the position is
+		// applied — loadGMap/loadMap reposition the character themselves.
+		if msg.Map != "" && msg.Map != g.activeGMap && msg.Map != g.currentMapName {
+			if strings.HasSuffix(strings.ToLower(msg.Map), ".gmap") {
+				g.loadGMap(msg.Map)
+			} else {
+				g.loadMap(msg.Map, false)
+			}
+		}
 		if g.localChar != nil {
 			// Only use the server's stored position when no explicit spawn is configured.
 			if Cfg.SpawnX == 0 && Cfg.SpawnY == 0 {
@@ -114,13 +97,10 @@ func (g *Game) handleServerMsg(data []byte) {
 				ch.TargetX, ch.TargetY = p.X, p.Y
 				ch.Dir = p.Dir
 				ch.Moving = p.Moving
-				// Recompute velocity from authoritative state so the next
-				// dead-reckoning frame starts from the corrected baseline.
-				drSpeed := Cfg.PlayerSpeed
-				if p.Mounted {
-					drSpeed = Cfg.MountedSpeed
-				}
-				ch.velX, ch.velY = remoteVel(p.Dir, p.Moving, drSpeed)
+				// Use the server-measured velocity. Deriving it from Dir put
+				// diagonally-moving players on the wrong axis, and the error was
+				// corrected visibly on the next snapshot.
+				ch.velX, ch.velY = p.VX, p.VY
 				ch.Gralats = p.Gralats
 				ch.Playtime = p.Playtime
 				if p.MaxHP > 0 {
@@ -195,11 +175,7 @@ func (g *Game) handleServerMsg(data []byte) {
 				if p.Mounted {
 					ch.AnimState = AnimRide
 				}
-				drSpeed := Cfg.PlayerSpeed
-				if p.Mounted {
-					drSpeed = Cfg.MountedSpeed
-				}
-				ch.velX, ch.velY = remoteVel(p.Dir, p.Moving, drSpeed)
+				ch.velX, ch.velY = p.VX, p.VY
 				ch.SetCosmetics(p.Body, p.Head, p.Hat, p.Shield, p.Sword)
 				g.otherPlayers[p.ID] = ch
 			}
@@ -214,13 +190,17 @@ func (g *Game) handleServerMsg(data []byte) {
 		seenNPC := make(map[string]bool)
 		for _, n := range msg.NPCs {
 			seenNPC[n.ID] = true
-			drSpeed := npcDeadReckonSpeed(n.NPCType)
 			if ch, ok := g.npcs[n.ID]; ok {
 				ch.missedTicks = 0
 				ch.TargetX, ch.TargetY = n.X, n.Y
 				ch.Dir = n.Dir
 				ch.Moving = n.Moving
-				ch.velX, ch.velY = remoteVel(n.Dir, n.Moving, drSpeed)
+				// Use the server-measured velocity rather than inferring one from
+				// Dir: NPCs move diagonally at randomised speeds, and an NPC
+				// sliding along a wall faces the direction it is trying to go, not
+				// the one it is actually moving in.
+				ch.velX, ch.velY = n.VX, n.VY
+				ch.RiddenBy = n.MountedBy
 				ch.HP = n.HP
 				ch.MaxHP = n.MaxHP
 				if n.AnimState == "dead" && ch.AnimState != AnimDead {
@@ -235,7 +215,8 @@ func (g *Game) handleServerMsg(data []byte) {
 				if n.AnimState == "dead" {
 					ch.AnimState = AnimDead
 				}
-				ch.velX, ch.velY = remoteVel(n.Dir, n.Moving, drSpeed)
+				ch.velX, ch.velY = n.VX, n.VY
+				ch.RiddenBy = n.MountedBy
 				g.npcs[n.ID] = ch
 			}
 		}
@@ -282,6 +263,21 @@ func (g *Game) handleServerMsg(data []byte) {
 
 	case "gralat_update":
 		g.localGralats = msg.GralatN
+
+	// ── Admin debug panel ──
+	case "debug_info":
+		g.adminMenu.SetDebugInfo(msg.DebugInfo)
+
+	case "npc_debug_list":
+		g.adminMenu.SetNPCDebug(msg.DebugNPCs)
+
+	case "teleport_ok":
+		// The client owns movement, so it must adopt the server's position
+		// explicitly rather than waiting for a state snapshot to correct it.
+		if g.localChar != nil {
+			g.localChar.X, g.localChar.Y = msg.X, msg.Y
+			g.localChar.TargetX, g.localChar.TargetY = msg.X, msg.Y
+		}
 
 	case "npc_dialog":
 		g.npcDialog = msg.Msg

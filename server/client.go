@@ -31,9 +31,15 @@ type Client struct {
 	savedPlaytime int       // playtime seconds accumulated before this session
 	currentMap    string    // which map this client is currently on
 	isAdmin       bool      // whether this player has admin privileges
+	// lastX/lastY are the position at the previous game-loop tick, used to
+	// measure the velocity sent to other clients for dead reckoning.
+	lastX, lastY float64
 }
 
-const defaultMap = "maps/GraalRebornMap.tmx"
+// defaultMap is the map instance every entity with an empty mapID belongs to.
+// Set from config.json at startup by resolveDefaultMap — it must match the map
+// the client actually loads, or built-in content is stranded on a phantom map.
+var defaultMap = "maps/GraalRebornMap.tmx"
 
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
@@ -68,8 +74,15 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	spawnX := clamp(user.LastX, 0, mapWidth-32)
-	spawnY := clamp(user.LastY, 0, mapHeight-32)
+	// Clamp to the actual world bounds, not the 1120px TMX constants — on a
+	// larger GMAP world those constants would yank every returning player back
+	// into the top-left corner.
+	worldW, worldH := globalHub.worldW, globalHub.worldH
+	if worldW <= 0 || worldH <= 0 {
+		worldW, worldH = mapWidth, mapHeight
+	}
+	spawnX := clamp(user.LastX, 0, worldW-32)
+	spawnY := clamp(user.LastY, 0, worldH-32)
 	playerID := fmt.Sprintf("player_%d", user.ID)
 
 	playerCombat := newCombat(playerMaxHP)
@@ -86,7 +99,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		npcCooldowns:  make(map[string]time.Time),
 		sessionStart:  time.Now(),
 		savedPlaytime: user.Playtime,
-		currentMap:    defaultMap,
+		currentMap:    mapOrDefault(user.CurrentMap), // restored: last_x/last_y mean nothing on another map
 		isAdmin:       db.IsAdmin(user.ID),
 		state: PlayerState{
 			ID:       playerID,
@@ -112,6 +125,7 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 		"name":      user.Name,
 		"x":         spawnX,
 		"y":         spawnY,
+		"map":       client.currentMap, // instance the x/y above belong to; client loads it
 		"gralat_n":  user.Gralats,
 		"playtime":  user.Playtime,
 		"body":      user.Body,
@@ -214,6 +228,23 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			handleAdminSpawnWorldItem(client, raw)
 		case "admin_remove_world_item":
 			handleAdminRemoveWorldItem(client, raw)
+		// ── Admin debug panel ─────────────────────────────────
+		case "admin_debug_info":
+			handleAdminDebugInfo(client)
+		case "admin_npc_list":
+			handleAdminNPCList(client)
+		case "admin_npc_behaviour":
+			handleAdminSetNPCBehaviour(client, raw)
+		case "admin_npc_action":
+			handleAdminNPCAction(client, raw)
+		case "admin_teleport":
+			handleAdminTeleport(client, raw)
+		case "admin_gralats":
+			handleAdminSetGralats(client, raw)
+		case "admin_set_hp":
+			handleAdminSetHP(client, raw)
+		case "admin_spawn_enemy":
+			handleAdminSpawnEnemyMsg(client, raw)
 		// ── Friends ───────────────────────────────────────────
 		case "friend_add":
 			handleFriendAdd(client, raw)
@@ -794,9 +825,9 @@ func handleCollectGralat(c *Client, raw []byte) {
 	if json.Unmarshal(raw, &msg) != nil || msg.GralatID == "" {
 		return
 	}
-	value := globalHub.collectGralat(msg.GralatID)
+	value := globalHub.collectGralat(msg.GralatID, mapOrDefault(c.currentMap), c.state.X, c.state.Y)
 	if value <= 0 {
-		return
+		return // already taken, on another map, or out of reach
 	}
 	newTotal, _ := db.AddGralats(c.userID, value)
 	globalHub.mu.Lock()
@@ -823,17 +854,35 @@ func handleTalkNPC(c *Client, raw []byte) {
 		return
 	}
 
-	var npc *NPC
+	// Copy every field needed while holding the lock. The 60 Hz game loop mutates
+	// NPC state under the write lock, so the *NPC must not be dereferenced once
+	// the lock is released.
+	// Resolve dialog here too: Lua custom dialog takes priority over the
+	// type-based default.
+	var (
+		found      bool
+		npcName    string
+		npcType    int
+		dialogText string
+		gMin, gMax int
+	)
 	globalHub.mu.RLock()
-	for _, n := range globalHub.npcs {
-		if n.state.ID == msg.NPCID {
-			npc = n
-			break
+	if n := globalHub.findNPCOnMap(msg.NPCID, mapOrDefault(c.currentMap)); n != nil {
+		found = true
+		npcName = n.state.Name
+		npcType = n.state.NPCType
+		if n.customDialog != "" {
+			dialogText = n.customDialog
+			gMin, gMax = n.customGMin, n.customGMax
+		} else {
+			def := npcDialogDefs[npcType%len(npcDialogDefs)]
+			dialogText = def.msg
+			gMin, gMax = def.minG, def.maxG
 		}
 	}
 	globalHub.mu.RUnlock()
-	if npc == nil || npc.state.NPCType == NPCTypeHorse {
-		return // horses don't talk
+	if !found || npcType == NPCTypeHorse {
+		return // not on this map, or horses (which don't talk)
 	}
 
 	const cooldown = 120 * time.Second
@@ -841,7 +890,7 @@ func handleTalkNPC(c *Client, raw []byte) {
 		remaining := int((cooldown - time.Since(last)).Seconds())
 		data, _ := json.Marshal(map[string]interface{}{
 			"type":     "npc_dialog",
-			"msg":      fmt.Sprintf("%s: I have nothing more to say for now... (%ds)", npc.state.Name, remaining),
+			"msg":      fmt.Sprintf("%s: I have nothing more to say for now... (%ds)", npcName, remaining),
 			"gralat_n": 0,
 		})
 		select {
@@ -851,17 +900,6 @@ func handleTalkNPC(c *Client, raw []byte) {
 		return
 	}
 
-	// Resolve dialog: Lua custom dialog takes priority over the type-based default.
-	var dialogText string
-	var gMin, gMax int
-	if npc.customDialog != "" {
-		dialogText = npc.customDialog
-		gMin, gMax = npc.customGMin, npc.customGMax
-	} else {
-		def := npcDialogDefs[npc.state.NPCType%len(npcDialogDefs)]
-		dialogText = def.msg
-		gMin, gMax = def.minG, def.maxG
-	}
 	if gMax < gMin {
 		gMax = gMin
 	}
@@ -878,7 +916,7 @@ func handleTalkNPC(c *Client, raw []byte) {
 
 	c.npcCooldowns[msg.NPCID] = time.Now()
 
-	dialog := fmt.Sprintf("%s: %s", npc.state.Name, dialogText)
+	dialog := fmt.Sprintf("%s: %s", npcName, dialogText)
 	data, _ := json.Marshal(map[string]interface{}{
 		"type":     "npc_dialog",
 		"msg":      dialog,
@@ -888,8 +926,8 @@ func handleTalkNPC(c *Client, raw []byte) {
 	case c.send <- data:
 	default:
 	}
-	log.Printf("[NPC] %s -> %s: +%d gralats (%d total)", npc.state.Name, c.name, gralatN, newTotal)
-	switch npc.state.NPCType {
+	log.Printf("[NPC] %s -> %s: +%d gralats (%d total)", npcName, c.name, gralatN, newTotal)
+	switch npcType {
 	case NPCTypeMerchant:
 		go advanceTalkQuest(c, "merchant")
 	case NPCTypeVillager:
@@ -909,22 +947,20 @@ func handleSwordHit(c *Client, raw []byte) {
 		return
 	}
 
-	// Server-side proximity validation (within 100 px)
+	// Server-side proximity validation (within 100 px), scoped to the attacker's map.
 	const maxReach = 100.0
+	myMap := mapOrDefault(c.currentMap)
 	var npcX, npcY float64
 	var found bool
 	globalHub.mu.RLock()
-	for _, n := range globalHub.npcs {
-		if n.state.ID == msg.NPCID && n.combat.IsAlive() {
-			npcX, npcY = n.state.X, n.state.Y
-			found = true
-			break
-		}
+	if n := globalHub.findNPCOnMap(msg.NPCID, myMap); n != nil && n.combat.IsAlive() {
+		npcX, npcY = n.state.X, n.state.Y
+		found = true
 	}
 	globalHub.mu.RUnlock()
 
 	if !found {
-		return
+		return // dead, missing, or on another map
 	}
 
 	dx := npcX - c.state.X
@@ -933,7 +969,7 @@ func handleSwordHit(c *Client, raw []byte) {
 		return // cheating or network lag — ignore
 	}
 
-	newHP, killed := globalHub.damageNPC(msg.NPCID, 1)
+	newHP, killed := globalHub.damageNPC(msg.NPCID, myMap, 1)
 	if newHP < 0 {
 		return // NPC on cooldown or immortal
 	}
@@ -954,7 +990,8 @@ func handleSwordHit(c *Client, raw []byte) {
 		// Advance kill quests if the NPC was aggressive
 		globalHub.mu.RLock()
 		for _, n := range globalHub.npcs {
-			if n.state.ID == msg.NPCID && n.state.NPCType == NPCTypeAggressive {
+			if n.state.ID == msg.NPCID && mapOrDefault(n.mapID) == myMap &&
+				n.state.NPCType == NPCTypeAggressive {
 				go advanceKillQuest(c)
 				break
 			}
@@ -973,16 +1010,21 @@ func handlePvPHit(attacker *Client, raw []byte) {
 		return
 	}
 
-	// Proximity validation (within 120px)
+	// Proximity validation (within 120px), and both players must be on the same
+	// map — coordinates repeat across map instances, so without this check a
+	// player can hit someone standing at the same spot on a different map.
 	const maxReach = 120.0
+	attackerMap := mapOrDefault(attacker.currentMap)
 	var target *Client
 	globalHub.mu.RLock()
 	for c := range globalHub.clients {
 		if c.playerID == msg.TargetID {
-			dx := c.state.X - attacker.state.X
-			dy := c.state.Y - attacker.state.Y
-			if dx*dx+dy*dy <= maxReach*maxReach {
-				target = c
+			if mapOrDefault(c.currentMap) == attackerMap {
+				dx := c.state.X - attacker.state.X
+				dy := c.state.Y - attacker.state.Y
+				if dx*dx+dy*dy <= maxReach*maxReach {
+					target = c
+				}
 			}
 			break
 		}
@@ -1036,17 +1078,22 @@ func handleMountNPC(c *Client, raw []byte) {
 		return
 	}
 
-	// Proximity check (within 64 px)
+	// Proximity check (within 64 px), scoped to the rider's map.
 	const maxDist = 64.0
+	myMap := mapOrDefault(c.currentMap)
 	var npcX, npcY float64
+	var found bool
 	globalHub.mu.RLock()
-	for _, n := range globalHub.npcs {
-		if n.state.ID == msg.NPCID {
-			npcX, npcY = n.state.X, n.state.Y
-			break
-		}
+	if n := globalHub.findNPCOnMap(msg.NPCID, myMap); n != nil {
+		npcX, npcY = n.state.X, n.state.Y
+		found = true
 	}
 	globalHub.mu.RUnlock()
+
+	if !found {
+		return // missing or on another map — without this an unknown ID would
+		// be compared against (0,0) and pass for players standing near the origin
+	}
 
 	dx := npcX - c.state.X
 	dy := npcY - c.state.Y
@@ -1054,7 +1101,7 @@ func handleMountNPC(c *Client, raw []byte) {
 		return
 	}
 
-	if !globalHub.mountNPC(msg.NPCID, c.playerID) {
+	if !globalHub.mountNPC(msg.NPCID, myMap, c.playerID) {
 		return // horse already taken or wrong type
 	}
 
@@ -1284,11 +1331,15 @@ func handleBuyWorldItem(c *Client, raw []byte) {
 		return
 	}
 
-	globalHub.mu.RLock()
+	// Copy the item under the lock; admins may remove it concurrently.
+	// Scoped to the buyer's map so items cannot be bought from another instance.
+	myMap := mapOrDefault(c.currentMap)
 	var item *WorldSpawnItem
+	globalHub.mu.RLock()
 	for _, wi := range globalHub.worldItems {
-		if wi.ID == msg.ID {
-			item = wi
+		if wi.ID == msg.ID && mapOrDefault(wi.MapID) == myMap {
+			cp := *wi
+			item = &cp
 			break
 		}
 	}
@@ -1360,14 +1411,16 @@ func handleAdminSpawnWorldItem(c *Client, raw []byte) {
 		Y:          msg.Y,
 		Price:      msg.Price,
 		ItemID:     msg.ItemID,
+		// Spawn on the admin's own map, not always the default one.
+		MapID: mapOrDefault(c.currentMap),
 	}
 	globalHub.addWorldItem(wi)
 	db.SaveWorldItem(db.WorldItemRow{
 		ID: id, Name: wi.Name, SpritePath: wi.SpritePath,
 		X: wi.X, Y: wi.Y, Price: wi.Price, ItemID: wi.ItemID,
-		MapName: defaultMap,
+		MapName: wi.MapID,
 	})
-	log.Printf("[ADMIN] %s spawned world item '%s' at (%.0f,%.0f)", c.name, wi.Name, wi.X, wi.Y)
+	log.Printf("[ADMIN] %s spawned world item '%s' at (%.0f,%.0f) on %s", c.name, wi.Name, wi.X, wi.Y, wi.MapID)
 }
 
 func handleAdminRemoveWorldItem(c *Client, raw []byte) {

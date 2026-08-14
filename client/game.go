@@ -257,6 +257,9 @@ func (g *Game) Update() error {
 		}
 
 	case StatePlaying:
+		// Must run before updatePlaying: entity dead reckoning clamps against
+		// these, and in GMAP mode the real world size only arrives asynchronously.
+		g.refreshWorldBounds()
 		if err := g.updatePlaying(dt); err != nil {
 			return err
 		}
@@ -294,6 +297,26 @@ func (g *Game) worldSize() (int, int) {
 		return g.gameMap.WorldW(), g.gameMap.WorldH()
 	}
 	return worldW, worldH
+}
+
+// activeWorldW/H hold the pixel size of the world currently loaded.
+//
+// Character.Update clamps dead-reckoned positions against them and has no access
+// to the Game, so they live at package level. They must be refreshed every frame
+// rather than once at map load: in GMAP mode the real size only becomes known
+// after the metadata request completes.
+//
+// Leaving them at the compile-time TMX constants (1120 px) is not a harmless
+// approximation — on a larger world every remote entity's predicted position was
+// clamped back to ~1088 px each frame, tripping the "large desync" snap and
+// making NPCs and other players flicker between their real position and the
+// top-left corner of the world.
+var activeWorldW, activeWorldH = float64(worldW), float64(worldH)
+
+func (g *Game) refreshWorldBounds() {
+	if w, h := g.worldSize(); w > 0 && h > 0 {
+		activeWorldW, activeWorldH = float64(w), float64(h)
+	}
 }
 
 // terrainAt returns the terrain ("water", "lava", or "") at the given rect.

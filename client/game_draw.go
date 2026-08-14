@@ -99,6 +99,11 @@ func (g *Game) drawWorld(dst *ebiten.Image, camX, camY float64) {
 
 	g.mu.Lock()
 	for _, n := range g.npcs {
+		// A ridden horse is drawn by its rider's mount gani; drawing it here too
+		// leaves a duplicate horse sprite under the rider.
+		if n.RiddenBy != "" {
+			continue
+		}
 		n.Draw(dst, camX, camY)
 	}
 	for _, p := range g.otherPlayers {

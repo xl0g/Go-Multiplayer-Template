@@ -19,6 +19,13 @@ type PlayerState struct {
 	Mounted   bool    `json:"mounted,omitempty"`
 	HP        int     `json:"hp,omitempty"`
 	MaxHP     int     `json:"maxHp,omitempty"`
+	// VX/VY is the velocity measured for this player last tick, in px/s.
+	// Other clients dead-reckon with it. Inferring it from Dir cannot work:
+	// diagonal movement has two non-zero components but only one facing, so the
+	// prediction pushed remote players along the wrong axis and they were
+	// corrected — visibly — on the next snapshot.
+	VX float64 `json:"vx,omitempty"`
+	VY float64 `json:"vy,omitempty"`
 }
 
 // NPCState is the synchronized state of an NPC.
@@ -34,6 +41,12 @@ type NPCState struct {
 	MaxHP     int     `json:"maxHp"`
 	MountedBy string  `json:"mountedBy,omitempty"`
 	AnimState string  `json:"anim,omitempty"`
+	// VX/VY is the velocity the NPC actually achieved last tick, in px/s.
+	// Clients dead-reckon with it instead of guessing from Dir and a per-type
+	// speed: NPCs move diagonally at randomised speeds, so any guess drifts from
+	// the authoritative position and gets visibly snapped back every update.
+	VX float64 `json:"vx,omitempty"`
+	VY float64 `json:"vy,omitempty"`
 }
 
 // GralatPickup is a collectable coin in the world.
@@ -42,6 +55,9 @@ type GralatPickup struct {
 	X     float64 `json:"x"`
 	Y     float64 `json:"y"`
 	Value int     `json:"value"` // 1 | 5 | 30 | 100
+	// MapID is the map instance this pickup lives on. Server-side only —
+	// clients only ever receive pickups for the map they are on.
+	MapID string `json:"-"`
 }
 
 // InventoryItem represents a usable item in a player's inventory.
@@ -52,7 +68,8 @@ type InventoryItem struct {
 	Quantity int    `json:"quantity"`
 }
 
-// WorldSpawnItem is an admin-spawned decorative/shop item visible to all players.
+// WorldSpawnItem is an admin-spawned decorative/shop item visible to all players
+// on the same map.
 type WorldSpawnItem struct {
 	ID         string  `json:"id"`
 	Name       string  `json:"name"`
@@ -61,4 +78,8 @@ type WorldSpawnItem struct {
 	Y          float64 `json:"y"`
 	Price      int     `json:"price"`
 	ItemID     string  `json:"item_id,omitempty"`
+	// MapID is the map instance this item lives on (persisted as
+	// world_items.map_name). Server-side only — clients only ever receive
+	// items for the map they are on.
+	MapID string `json:"-"`
 }
