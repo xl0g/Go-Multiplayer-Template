@@ -200,6 +200,7 @@ func (g *Game) handleServerMsg(data []byte) {
 				// sliding along a wall faces the direction it is trying to go, not
 				// the one it is actually moving in.
 				ch.velX, ch.velY = n.VX, n.VY
+				ch.RiddenBy = n.MountedBy
 				ch.HP = n.HP
 				ch.MaxHP = n.MaxHP
 				if n.AnimState == "dead" && ch.AnimState != AnimDead {
@@ -215,6 +216,7 @@ func (g *Game) handleServerMsg(data []byte) {
 					ch.AnimState = AnimDead
 				}
 				ch.velX, ch.velY = n.VX, n.VY
+				ch.RiddenBy = n.MountedBy
 				g.npcs[n.ID] = ch
 			}
 		}

@@ -439,12 +439,14 @@ func (g *Game) updatePlaying(dt float64) error {
 		}
 	}
 
-	// Nearest NPC (main map only) and world item
-	if g.currentMapName == "maps/GraalRebornMap.tmx" || g.currentMapName == "" {
-		g.nearNPCID, g.nearNPCType = g.nearestNPC()
-	} else {
-		g.nearNPCID, g.nearNPCType = "", -1
-	}
+	// Nearest NPC and world item.
+	//
+	// This used to be gated on currentMapName being the old default TMX map, which
+	// silently disabled talking to and mounting NPCs on every other map — and
+	// stayed disabled after returning from a building, since currentMapName keeps
+	// the interior's name. The server only ever sends NPCs on the player's own map
+	// instance, so no map check belongs here.
+	g.nearNPCID, g.nearNPCType = g.nearestNPC()
 	g.nearWorldItem = g.findNearWorldItem()
 
 	// Sword hit detection
@@ -900,6 +902,9 @@ func (g *Game) nearestNPC() (id string, npcType int) {
 	bestID := ""
 	bestType := -1
 	for nid, npc := range g.npcs {
+		if npc.RiddenBy != "" {
+			continue // someone is on it: not a thing you can walk up to
+		}
 		dx := npc.X + float64(frameW)/2 - px
 		dy := npc.Y + float64(frameH)/2 - py
 		d2 := dx*dx + dy*dy

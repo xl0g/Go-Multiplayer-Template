@@ -57,32 +57,20 @@ func mapOrDefault(m string) string {
 // values only ever made sense for one particular map.
 // A zero Behaviour value means "use the type's default" (see
 // defaultBehaviourFor); set it explicitly only to override that.
+// Deliberately small: one NPC per behaviour worth exercising, close enough to
+// spawn to reach on foot. A crowd makes it impossible to tell which NPC is
+// misbehaving. Use the admin panel (Tab → PLAYER → E/M) to add enemies on demand.
 var builtinNPCDefs = []struct {
 	name      string
 	dx, dy    float64
 	npcType   int
 	behaviour Behaviour
 }{
-	// Regular NPCs — mostly wander near their home
-	{"Thibaut the Villager", -180, -120, NPCTypeVillager, BehaviourWander},
 	{"Marceline the Merchant", 120, -40, NPCTypeMerchant, BehaviourStatic},
-	{"Eleanor the Traveller", -60, 160, NPCTypeTraveler, BehaviourRoam},
-	{"Baptiste the Farmer", 200, 200, NPCTypeFarmer, BehaviourWander},
-	// Guards walk a patrol route and join fights when allies call for help
-	{"Garde Renaud", -220, -30, NPCTypeGuard, BehaviourPatrol},
-	{"Garde Solène", 260, -110, NPCTypeGuard, BehaviourPatrol},
-	// Passive animals (flee from players)
-	{"Lapin", -130, 30, NPCTypePassive, BehaviourPassive},
-	{"Biche", 270, 80, NPCTypePassive, BehaviourPassive},
-	{"Poulet", 20, 280, NPCTypePassive, BehaviourPassive},
-	// Aggressive monsters
-	{"Slime Rouge", -280, 380, NPCTypeAggressive, BehaviourAggressive},
-	{"Slime Vert", 320, 330, NPCTypeAggressive, BehaviourAggressive},
-	{"Gobelin", 70, 480, NPCTypeAggressive, BehaviourAggressive},
-	{"Bat", 420, -20, NPCTypeAggressive, BehaviourRoam}, // roams, then chases once it spots you
-	// Rideable horses (mount system)
-	{"Épona", 0, 40, NPCTypeHorse, BehaviourWander},
-	{"Bourrin", 160, 380, NPCTypeHorse, BehaviourWander},
+	{"Garde Renaud", -180, -30, NPCTypeGuard, BehaviourPatrol},
+	{"Épona", 0, 60, NPCTypeHorse, BehaviourWander},
+	{"Slime Rouge", -150, 200, NPCTypeAggressive, BehaviourAggressive},
+	{"Gobelin", 190, 190, NPCTypeAggressive, BehaviourAggressive},
 }
 
 // resolveSpawn returns the anchor point for built-in content: the configured

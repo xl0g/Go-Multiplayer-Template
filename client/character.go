@@ -119,6 +119,12 @@ type Character struct {
 	// Mount state
 	Mounted bool
 
+	// RiddenBy is the player ID currently riding this NPC ("" = nobody).
+	// A ridden horse must not be drawn as an entity of its own: the rider's
+	// mount gani already draws the horse, so doing both leaves a second,
+	// stationary horse sprite showing underneath the rider.
+	RiddenBy string
+
 	// HP / MaxHP for damageable NPCs (0 = immortal)
 	HP    int
 	MaxHP int
