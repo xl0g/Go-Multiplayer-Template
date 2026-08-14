@@ -526,6 +526,26 @@ func (h *Hub) runGameLoop() {
 		if h.startedAt.IsZero() {
 			h.startedAt = now
 		}
+
+		// Tick player combat, not just NPC combat. Players share CombatEntity, so
+		// without this their hit-invulnerability window (hitCD) is set on the first
+		// hit and never decays — every later Damage() call returns immune, and NPCs
+		// appear to hit a player exactly once and then never again.
+		//
+		// Also measure each player's velocity for other clients' dead reckoning,
+		// the same way NPC velocity is measured.
+		for c := range h.clients {
+			c.combat.Tick(dt)
+
+			dx, dy := c.state.X-c.lastX, c.state.Y-c.lastY
+			c.lastX, c.lastY = c.state.X, c.state.Y
+			if dx*dx+dy*dy > maxTickStep*maxTickStep {
+				c.state.VX, c.state.VY = 0, 0 // teleport, not motion
+			} else {
+				c.state.VX, c.state.VY = dx/dt, dy/dt
+			}
+		}
+
 		// Build player snapshots per map for NPC AI.
 		playersByMap := make(map[string][]playerPos, 4)
 		for c := range h.clients {
@@ -542,12 +562,18 @@ func (h *Hub) runGameLoop() {
 		type npcAttack struct {
 			playerID string
 			mapID    string
+			name     string
+			x, y     float64 // attacker position, so the client knocks back correctly
 		}
 		var attacks []npcAttack
+		colliderFor := h.colliderResolver()
 		for _, n := range h.npcs {
 			mid := mapOrDefault(n.mapID)
-			if attackedID := n.update(dt, h.worldColl, playersByMap[mid]); attackedID != "" {
-				attacks = append(attacks, npcAttack{playerID: attackedID, mapID: mid})
+			if attackedID := n.update(dt, colliderFor(mid), playersByMap[mid]); attackedID != "" {
+				attacks = append(attacks, npcAttack{
+					playerID: attackedID, mapID: mid,
+					name: n.state.Name, x: n.state.X, y: n.state.Y,
+				})
 			}
 		}
 		h.propagateAlerts()
@@ -571,7 +597,18 @@ func (h *Hub) runGameLoop() {
 					break // immune (hit cooldown)
 				}
 				c.state.HP = newHP
-				msg := map[string]interface{}{"type": "pvp_damage", "hp": newHP}
+				// Carry the attacker's identity and position: the client uses them
+				// for the damage number and to knock the player away from the NPC.
+				// Without them the knockback aimed away from (0,0) — the corner of
+				// the world — so a hit barely read as a hit.
+				msg := map[string]interface{}{
+					"type":   "pvp_damage",
+					"hp":     newHP,
+					"from":   atk.name,
+					"damage": aggroDamage,
+					"atk_x":  atk.x,
+					"atk_y":  atk.y,
+				}
 				if killed {
 					c.state.AnimState = "dead"
 					msg["killed"] = true
@@ -601,6 +638,41 @@ func (h *Hub) runGameLoop() {
 	}
 }
 
+// colliderResolver returns a per-map collider lookup that layers world items on
+// top of the static map collision, so NPCs walk around placed objects instead of
+// through them.
+//
+// The common case — no world items at all — allocates nothing and just hands back
+// the shared static collider.
+// Caller must hold h.mu.
+func (h *Hub) colliderResolver() func(mapID string) WorldCollider {
+	if len(h.worldItems) == 0 {
+		return func(string) WorldCollider { return h.worldColl }
+	}
+
+	obstacles := make(map[string][]aabb, 2)
+	for _, wi := range h.worldItems {
+		mid := mapOrDefault(wi.MapID)
+		obstacles[mid] = append(obstacles[mid], aabb{
+			x: wi.X + worldItemInset, y: wi.Y + worldItemInset,
+			w: worldItemBox, h: worldItemBox,
+		})
+	}
+
+	cache := make(map[string]WorldCollider, len(obstacles)+1)
+	return func(mapID string) WorldCollider {
+		if c, ok := cache[mapID]; ok {
+			return c
+		}
+		var c WorldCollider = h.worldColl
+		if obs := obstacles[mapID]; len(obs) > 0 {
+			c = &obstacleCollider{base: h.worldColl, obstacles: obs}
+		}
+		cache[mapID] = c
+		return c
+	}
+}
+
 // propagateAlerts pulls nearby allies into a fight when an NPC raises an alert,
 // so a group reacts together instead of one member at a time. Alerts do not
 // cross map instances, and passive NPCs never answer them.
@@ -620,7 +692,11 @@ func (h *Hub) propagateAlerts() {
 		mid := mapOrDefault(n.mapID)
 		for _, other := range h.npcs {
 			if other == n || mapOrDefault(other.mapID) != mid ||
-				!other.combat.IsAlive() || other.behaviour == BehaviourPassive {
+				!other.combat.IsAlive() || !other.canFight() {
+				continue
+			}
+			// Only rally allies of the same side.
+			if g := other.alertGroup(); g == 0 || g != n.alertGroup() {
 				continue
 			}
 			dx, dy := other.state.X-n.state.X, other.state.Y-n.state.Y

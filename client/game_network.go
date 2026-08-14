@@ -7,33 +7,13 @@ import (
 	"time"
 )
 
-// remoteVel returns the dead-reckoning velocity (px/s) for a remote entity
-// based on its current direction and moving flag.
-// This is used to predict where the entity will be between server snapshots,
-// compensating for the one-way network latency.
-func remoteVel(dir int, moving bool, speed float64) (vx, vy float64) {
-	if !moving {
-		return 0, 0
-	}
-	switch dir {
-	case 0: // up
-		return 0, -speed
-	case 1: // left
-		return -speed, 0
-	case 2: // down
-		return 0, speed
-	case 3: // right
-		return speed, 0
-	}
-	return 0, 0
-}
-
-// NPC dead reckoning no longer guesses a speed per type: the server sends the
-// velocity it actually measured in NPCState.VX/VY. The old per-type guess is
-// gone because it could not be right — NPC speeds are randomised per NPC, they
-// move diagonally, and a wall-sliding NPC faces a direction it is not moving in.
-// remoteVel above is still used for remote players, whose speed comes from the
-// shared config.
+// Dead reckoning uses the velocity the server measured for each entity
+// (PlayerState.VX/VY, NPCState.VX/VY) rather than inferring one from the facing
+// direction. Inference could not be right: diagonal movement has two non-zero
+// components but only one facing, NPC speeds are randomised per NPC, and an
+// entity steering around an obstacle faces where it wants to go rather than
+// where it is going. Every mismatch showed up as a visible correction on the
+// next snapshot.
 
 // ──────────────────────────────────────────────────────────────
 // Network message processing
@@ -117,13 +97,10 @@ func (g *Game) handleServerMsg(data []byte) {
 				ch.TargetX, ch.TargetY = p.X, p.Y
 				ch.Dir = p.Dir
 				ch.Moving = p.Moving
-				// Recompute velocity from authoritative state so the next
-				// dead-reckoning frame starts from the corrected baseline.
-				drSpeed := Cfg.PlayerSpeed
-				if p.Mounted {
-					drSpeed = Cfg.MountedSpeed
-				}
-				ch.velX, ch.velY = remoteVel(p.Dir, p.Moving, drSpeed)
+				// Use the server-measured velocity. Deriving it from Dir put
+				// diagonally-moving players on the wrong axis, and the error was
+				// corrected visibly on the next snapshot.
+				ch.velX, ch.velY = p.VX, p.VY
 				ch.Gralats = p.Gralats
 				ch.Playtime = p.Playtime
 				if p.MaxHP > 0 {
@@ -198,11 +175,7 @@ func (g *Game) handleServerMsg(data []byte) {
 				if p.Mounted {
 					ch.AnimState = AnimRide
 				}
-				drSpeed := Cfg.PlayerSpeed
-				if p.Mounted {
-					drSpeed = Cfg.MountedSpeed
-				}
-				ch.velX, ch.velY = remoteVel(p.Dir, p.Moving, drSpeed)
+				ch.velX, ch.velY = p.VX, p.VY
 				ch.SetCosmetics(p.Body, p.Head, p.Hat, p.Shield, p.Sword)
 				g.otherPlayers[p.ID] = ch
 			}

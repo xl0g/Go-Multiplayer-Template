@@ -19,6 +19,10 @@ type PlayerState struct {
 	Mounted   bool    `json:"mounted,omitempty"`
 	HP        int     `json:"hp,omitempty"`
 	MaxHP     int     `json:"maxHp,omitempty"`
+	// VX/VY is the velocity the server measured for this player last tick, in
+	// px/s. Used directly for dead reckoning — see the note in server/types.go.
+	VX float64 `json:"vx,omitempty"`
+	VY float64 `json:"vy,omitempty"`
 }
 
 // NPCState represents an NPC's synchronized state.

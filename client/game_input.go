@@ -251,10 +251,16 @@ func (g *Game) updatePlaying(dt float64) error {
 		g.adminMenu.Close()
 	}
 
-	// Tab key: toggle admin menu (admin only) — guard skipped intentionally so Tab can open the menu
-	if inpututil.IsKeyJustPressed(ebiten.KeyTab) && !g.chat.IsOpen && g.isAdmin && !g.uiHasFocus() {
-		g.adminMenu.Toggle()
-		g.inventoryMenu.Close()
+	// Tab key: toggle the admin / debug panel (admin accounts only).
+	if inpututil.IsKeyJustPressed(ebiten.KeyTab) && !g.chat.IsOpen && !g.uiHasFocus() {
+		if g.isAdmin {
+			g.adminMenu.Toggle()
+			g.inventoryMenu.Close()
+		} else {
+			// Say so rather than doing nothing: a silent no-op is indistinguishable
+			// from a broken key, and the fix (granting admin) is not guessable.
+			g.chat.AddMessage("", "Admin only. Grant it with: ./game-server -setadmin "+g.localName, true)
+		}
 	}
 
 	// ── Virtual button clicks (must be before handlePlayerClick) ──

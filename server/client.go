@@ -31,6 +31,9 @@ type Client struct {
 	savedPlaytime int       // playtime seconds accumulated before this session
 	currentMap    string    // which map this client is currently on
 	isAdmin       bool      // whether this player has admin privileges
+	// lastX/lastY are the position at the previous game-loop tick, used to
+	// measure the velocity sent to other clients for dead reckoning.
+	lastX, lastY float64
 }
 
 // defaultMap is the map instance every entity with an empty mapID belongs to.

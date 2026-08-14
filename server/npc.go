@@ -27,6 +27,10 @@ const (
 	aggroDamage     = 1
 	aggroSpeed      = 90.0
 
+	// How long an attacking NPC shows its attack animation. Roughly the length
+	// of sword.gani so the swing reads as one motion.
+	npcAttackAnimTime = 0.45
+
 	// Aggro leash: how far an NPC may be dragged from its home before it gives
 	// up and walks back. Without a leash a player can pull a monster across the
 	// whole world and strand it there.
@@ -55,8 +59,13 @@ const (
 	spawnedEnemyAggroRange = 800.0
 	spawnedEnemyHP         = 6
 
-	// Passive NPC
-	passiveFleeRange = 100.0
+	// Passive NPC. Two thresholds, not one: fleeing starts inside
+	// passiveFleeRange and only stops past passiveFleeStop. With a single
+	// threshold an animal reaching the edge switched to wandering, drifted back
+	// toward its home (often back toward the player), got scared again, and
+	// flip-flopped every few frames — which reads on screen as flickering.
+	passiveFleeRange = 110.0
+	passiveFleeStop  = 210.0
 	passiveFleeSpeed = 120.0
 
 	// NPC bounding box used for every collision test. Spawn placement must use
@@ -65,8 +74,6 @@ const (
 	npcW = 28.0
 	npcH = 28.0
 
-	// How long an NPC may be completely blocked before its behaviour gives up on
-	// the current destination and picks another.
 	// Minimum reduction in distance-to-target that counts as making progress.
 	// Small enough not to reject genuinely slow movement, large enough that
 	// floating-point noise never reads as progress.
@@ -76,10 +83,14 @@ const (
 	// teleport rather than velocity (respawn, admin "bring", map placement).
 	maxTickStep = 64.0
 
-	blockedRetargetWander = 0.8
-	blockedRetargetRoam   = 1.5
-	blockedRetargetPatrol = 2.5
-	blockedGiveUpReturn   = 4.0
+	// How long an NPC may make no progress before its behaviour gives up on the
+	// current destination and picks another. Generous enough that steering has
+	// time to round a large obstacle — going around temporarily increases the
+	// distance to the target, so it counts as "no progress" while it happens.
+	blockedRetargetWander = 2.0
+	blockedRetargetRoam   = 3.0
+	blockedRetargetPatrol = 4.0
+	blockedGiveUpReturn   = 6.0
 )
 
 // Behaviour describes how an NPC acts when it is not reacting to combat.
@@ -187,12 +198,12 @@ type NPC struct {
 	mapID     string // map instance this NPC belongs to (empty = defaultMap)
 	mountedBy string // player ID currently riding this NPC (horses only)
 
-	stuckTimer    float64 // time spent continuously blocked against a wall
-	stuckAngle    float64 // committed detour direction while unsticking
-	stuckAngleSet bool    // whether stuckAngle currently holds a chosen detour
+	// steerSide is the side (+1/-1) the NPC is currently committed to when
+	// steering around an obstacle; 0 means the direct path is clear.
+	steerSide int
 	// blockedTime accumulates for as long as the NPC fails to get any closer to
-	// its destination than it has already been. Unlike stuckTimer it is not reset
-	// by the detour logic, so behaviours can tell "briefly scraping a wall" from
+	// its destination than it has already been. Steering around an obstacle does
+	// not reset it, so behaviours can tell "negotiating an obstacle" from
 	// "this destination is unreachable".
 	blockedTime float64
 	// bestDist is the closest the NPC has come to progTarget so far. Progress is
@@ -211,11 +222,17 @@ type NPC struct {
 	behaviour  Behaviour
 	state2     aiState
 	leashRange float64 // max distance from home while chasing (0 = default)
+	fleeing    bool    // passive NPCs: currently running from a player
 
 	// Patrol route, in world coordinates. Empty for non-patrolling NPCs.
 	waypoints []vec2
 	wpIndex   int
 	wpPause   float64 // remaining pause at the current waypoint
+
+	// attackAnim counts down the visible attack animation. Without it an NPC
+	// striking a player produced no visual cue at all, so being hit was only
+	// apparent from the HP bar.
+	attackAnim float64
 
 	// Alerting
 	alertCD      float64 // seconds until this NPC may raise another alert
@@ -306,6 +323,34 @@ func (n *NPC) SetWaypoints(pts []vec2) {
 	n.state2 = aiNormal
 }
 
+// canFight reports whether this NPC will answer an alert or fight back when
+// provoked. Villagers, animals and horses will not — a horse turning on a player
+// because a monster shouted nearby looked like a bug, and was one.
+func (n *NPC) canFight() bool {
+	if n.behaviour == BehaviourAggressive {
+		return true
+	}
+	switch n.state.NPCType {
+	case NPCTypeGuard, NPCTypeAggressive, NPCTypeSpawnedEnemy:
+		return true
+	}
+	return false
+}
+
+// alertGroup identifies whose alerts this NPC answers. Monsters rally monsters
+// and guards rally guards; bystanders (group 0) answer nobody. Without this a
+// guard joined a monster's attack on the player because the monster shouted,
+// which made no sense — a guard still fights back if the player hits it directly.
+func (n *NPC) alertGroup() int {
+	switch n.state.NPCType {
+	case NPCTypeAggressive, NPCTypeSpawnedEnemy:
+		return 1 // monsters
+	case NPCTypeGuard:
+		return 2 // guards
+	}
+	return 0
+}
+
 // raiseAlert marks this NPC as calling nearby allies for help, respecting the
 // per-NPC cooldown so a long fight does not re-alert every tick.
 // The hub's propagation pass consumes the flag.
@@ -319,9 +364,10 @@ func (n *NPC) raiseAlert() {
 // provoke makes the NPC react to being attacked: anything that is not passive
 // turns on its attacker, and either way nearby allies are called in.
 func (n *NPC) provoke() {
-	if n.behaviour != BehaviourPassive && n.state2 == aiNormal {
+	if n.canFight() && n.state2 == aiNormal {
 		n.state2 = aiChasing
 	}
+	// Anything raises an alert, even a rabbit: calling for help is not fighting.
 	n.raiseAlert()
 }
 
@@ -342,9 +388,12 @@ func (n *NPC) leash() float64 {
 func (n *NPC) syncState() {
 	n.state.HP = n.combat.HP
 	n.state.MaxHP = n.combat.MaxHP
-	if !n.combat.alive {
+	switch {
+	case !n.combat.alive:
 		n.state.AnimState = "dead"
-	} else if n.state.AnimState == "dead" {
+	case n.attackAnim > 0:
+		n.state.AnimState = "sword" // clients map this to sword.gani for any entity
+	case n.state.AnimState == "dead" || n.state.AnimState == "sword":
 		n.state.AnimState = ""
 	}
 }
@@ -404,6 +453,9 @@ func (n *NPC) updateAI(dt float64, collMap WorldCollider, players []playerPos) (
 	if n.alertCD > 0 {
 		n.alertCD -= dt
 	}
+	if n.attackAnim > 0 {
+		n.attackAnim -= dt
+	}
 	// raisedAlert is deliberately NOT cleared here: damageNPC can set it between
 	// ticks, and the hub's propagation pass (which runs after this) is what
 	// consumes and clears it.
@@ -411,7 +463,7 @@ func (n *NPC) updateAI(dt float64, collMap WorldCollider, players []playerPos) (
 	// An ally's alert promotes a non-aggressive NPC to chasing for this fight.
 	if n.alertedByAlly {
 		n.alertedByAlly = false
-		if n.behaviour != BehaviourPassive && n.state2 == aiNormal {
+		if n.canFight() && n.state2 == aiNormal {
 			n.state2 = aiChasing
 		}
 	}
@@ -491,7 +543,6 @@ func (n *NPC) updateAggressive(dt float64, collMap WorldCollider, players []play
 	if nearestID == "" || nearestDist > effectiveRange {
 		wasChasing := n.state2 == aiChasing
 		n.aggroTarget = ""
-		n.stuckTimer = 0
 		if wasChasing {
 			// Lost the target — walk back home rather than wandering off from
 			// wherever the chase ended.
@@ -523,6 +574,9 @@ func (n *NPC) updateAggressive(dt float64, collMap WorldCollider, players []play
 	// Attack if close enough and cooldown expired.
 	if nearestDist <= attackDist && n.combat.CanAttack() {
 		n.combat.atkCD = aggroAttackCD
+		n.attackAnim = npcAttackAnimTime
+		n.state.Moving = false // stand still for the swing instead of sliding
+		n.setDirFromDelta(nearestX-n.state.X, nearestY-n.state.Y)
 		return nearestID
 	}
 
@@ -531,18 +585,90 @@ func (n *NPC) updateAggressive(dt float64, collMap WorldCollider, players []play
 	return ""
 }
 
-// moveToward advances the NPC toward (tx, ty), splitting the X and Y steps so it
-// slides along walls instead of stopping dead against them.
+// steerOffsets are the heading deflections tried, in order, when the direct path
+// is blocked. Small deflections first, so the NPC only turns as much as it has to.
+var steerOffsets = []float64{
+	0,
+	25 * math.Pi / 180,
+	50 * math.Pi / 180,
+	75 * math.Pi / 180,
+	100 * math.Pi / 180,
+	130 * math.Pi / 180,
+	160 * math.Pi / 180,
+}
+
+// stepWithSteering moves the NPC one step along (dirX, dirY), deflecting the
+// heading around anything in the way. Reports whether it moved.
+//
+// This replaces the older "push straight, then nudge sideways when blocked"
+// approach, which made an NPC meeting an obstacle shuffle against it until it
+// happened to slip past. Deflecting the whole heading instead walks a curve
+// around the obstacle, and committing to one side (steerSide) for the duration
+// stops the NPC from alternating left and right every tick.
+func (n *NPC) stepWithSteering(collMap WorldCollider, dirX, dirY, step float64) bool {
+	if step <= 0 {
+		return false
+	}
+	base := math.Atan2(dirY, dirX)
+
+	if n.steerSide == 0 {
+		if mrand.Intn(2) == 0 {
+			n.steerSide = 1
+		} else {
+			n.steerSide = -1
+		}
+	}
+	preferred := float64(n.steerSide)
+
+	// Exhaust the committed side across every offset before considering the other
+	// side at all.
+	//
+	// Interleaving the two sides per offset looks natural but is wrong: a small
+	// deflection on the far side beats a larger one on the committed side, so an
+	// NPC walking down the face of an obstacle switches to walking up as soon as
+	// the downward angle it needs exceeds the upward angle available. The result
+	// is an NPC sliding up and down the obstacle forever instead of rounding it.
+	for pass := 0; pass < 2; pass++ {
+		sign := preferred
+		if pass == 1 {
+			sign = -preferred
+		}
+		for _, off := range steerOffsets {
+			if off == 0 && pass == 1 {
+				continue // straight ahead has no mirror
+			}
+			a := base + sign*off
+			nx := clamp(n.state.X+math.Cos(a)*step, 1, n.worldW-npcW-1)
+			ny := clamp(n.state.Y+math.Sin(a)*step, 1, n.worldH-npcH-1)
+			if !canMove(collMap, nx, ny, npcW, npcH) {
+				continue
+			}
+			movedX, movedY := nx-n.state.X, ny-n.state.Y
+			n.state.X, n.state.Y = nx, ny
+			switch {
+			case off == 0:
+				n.steerSide = 0 // straight path clear again: stop favouring a side
+			case pass == 1:
+				n.steerSide = -n.steerSide // committed side fully blocked, switch
+			}
+			// Face where it actually went, not where it wanted to go.
+			n.setDirFromDelta(movedX, movedY)
+			return true
+		}
+	}
+	return false
+}
+
+// moveToward advances the NPC toward (tx, ty), steering around obstacles.
 // Returns true once the NPC is within stopDist of the target.
 func (n *NPC) moveToward(dt float64, collMap WorldCollider, tx, ty, speed, stopDist float64) bool {
 	dx, dy := tx-n.state.X, ty-n.state.Y
-	dist := math.Sqrt(dx*dx + dy*dy)
+	dist := math.Hypot(dx, dy)
 	if dist <= stopDist {
 		n.state.Moving = false
-		n.stuckTimer = 0
-		n.stuckAngleSet = false
 		n.blockedTime = 0
 		n.bestDist = 0
+		n.steerSide = 0
 		return true
 	}
 
@@ -562,74 +688,21 @@ func (n *NPC) moveToward(dt float64, collMap WorldCollider, tx, ty, speed, stopD
 	if step > dist {
 		step = dist // don't overshoot and oscillate around the target
 	}
-	newX := clamp(n.state.X+(dx/dist)*step, 1, n.worldW-npcW-1)
-	newY := clamp(n.state.Y+(dy/dist)*step, 1, n.worldH-npcH-1)
 
-	if canMove(collMap, newX, n.state.Y, npcW, npcH) {
-		n.state.X = newX
-	}
-	if canMove(collMap, n.state.X, newY, npcW, npcH) {
-		n.state.Y = newY
-	}
+	n.stepWithSteering(collMap, dx, dy, step)
 
-	// Progress means getting closer to the target — not that a collision test
-	// passed, and not that the position changed at all. Two ways this used to go
-	// wrong and leave an NPC frozen while reporting Moving = true:
-	//   - On an axis-aligned leg (dy == 0, which every squarePatrol leg is) the
-	//     candidate Y equals the current Y, so the Y collision test trivially
-	//     passes on the position the NPC already occupies.
-	//   - While unsticking, the sideways detour changes the position without
-	//     bringing the NPC any nearer, which also read as movement.
-	// Both reset the blocked timers every tick, so no behaviour ever gave up on
-	// an unreachable destination.
+	// Progress means getting closer to the target than the NPC has ever been —
+	// not that a collision test passed, and not merely that the position changed.
+	// Both weaker definitions froze NPCs: on an axis-aligned leg the unchanged
+	// axis trivially passes its collision test, and steering around an obstacle
+	// changes the position without necessarily closing any distance.
 	if d := math.Hypot(tx-n.state.X, ty-n.state.Y); d < n.bestDist-progressEpsilon {
 		n.bestDist = d
-		n.stuckTimer = 0
-		n.stuckAngleSet = false
 		n.blockedTime = 0
 	} else {
 		n.blockedTime += dt
-		n.unstick(dt, collMap, dx, dy, step)
 	}
-	n.setDirFromDelta(dx, dy)
 	return false
-}
-
-// unstick handles an NPC pressed flat against a wall. After a short delay it
-// commits to one perpendicular detour direction and keeps it, rather than
-// re-rolling a random angle every tick — which made NPCs vibrate in place
-// against corners instead of walking around them.
-func (n *NPC) unstick(dt float64, collMap WorldCollider, dx, dy, step float64) {
-	n.stuckTimer += dt
-	if n.stuckTimer < 0.25 {
-		return
-	}
-	if !n.stuckAngleSet {
-		base := math.Atan2(dy, dx)
-		if mrand.Intn(2) == 0 {
-			n.stuckAngle = base + math.Pi/2
-		} else {
-			n.stuckAngle = base - math.Pi/2
-		}
-		n.stuckAngleSet = true
-	}
-
-	prevX, prevY := n.state.X, n.state.Y
-	sx := clamp(n.state.X+math.Cos(n.stuckAngle)*step, 1, n.worldW-npcW-1)
-	sy := clamp(n.state.Y+math.Sin(n.stuckAngle)*step, 1, n.worldH-npcH-1)
-	if canMove(collMap, sx, n.state.Y, npcW, npcH) {
-		n.state.X = sx
-	}
-	if canMove(collMap, n.state.X, sy, npcW, npcH) {
-		n.state.Y = sy
-	}
-	// Same rule as moveToward: only an actual change counts as escaping.
-	moved := n.state.X != prevX || n.state.Y != prevY
-	// Detour exhausted or not working — drop it so the other side is tried next.
-	if !moved || n.stuckTimer > 1.5 {
-		n.stuckAngleSet = false
-		n.stuckTimer = 0
-	}
 }
 
 // baselineMove runs the NPC's non-combat behaviour for one tick.
@@ -729,34 +802,50 @@ func (n *NPC) updatePassive(dt float64, collMap WorldCollider, players []playerP
 	nearestDist := math.MaxFloat64
 	var nearestX, nearestY float64
 	for _, p := range players {
-		dx := p.x - n.state.X
-		dy := p.y - n.state.Y
-		d := math.Sqrt(dx*dx + dy*dy)
+		d := math.Hypot(p.x-n.state.X, p.y-n.state.Y)
 		if d < nearestDist {
-			nearestDist = d
-			nearestX = p.x
-			nearestY = p.y
+			nearestDist, nearestX, nearestY = d, p.x, p.y
 		}
 	}
 
-	if nearestDist > passiveFleeRange {
+	// Hysteresis between the two flee thresholds — see passiveFleeStop.
+	if n.fleeing {
+		if nearestDist > passiveFleeStop {
+			n.fleeing = false
+		}
+	} else if nearestDist <= passiveFleeRange {
+		n.fleeing = true
+	}
+
+	if !n.fleeing {
 		n.updateWander(dt, collMap)
 		return
 	}
 
-	dx := n.state.X - nearestX
-	dy := n.state.Y - nearestY
-	dist := math.Sqrt(dx*dx + dy*dy)
-	if dist < 1 {
+	dx, dy := n.state.X-nearestX, n.state.Y-nearestY
+	if math.Hypot(dx, dy) < 1e-9 {
+		dx, dy = 1, 0 // exactly overlapping the player: any direction will do
+	}
+	// Flee as a direction, never as a destination: a "run to a point 200 px away"
+	// target recedes as the animal moves, so the stall detector in moveToward
+	// never sees progress and shakes the animal in place instead.
+	n.moveDir(dt, collMap, dx, dy, passiveFleeSpeed)
+}
+
+// moveDir steps the NPC along the (dx, dy) direction, steering around obstacles.
+// Unlike moveToward there is no destination, so progress is judged purely on the
+// position changing — right for fleeing, where the goal is "away from that".
+func (n *NPC) moveDir(dt float64, collMap WorldCollider, dx, dy, speed float64) {
+	if math.Hypot(dx, dy) < 1e-9 {
 		n.state.Moving = false
 		return
 	}
-	// Flee toward a point directly away from the player, going through
-	// moveToward so wall sliding and stuck detection are shared with every other
-	// behaviour rather than reimplemented here.
-	fleeX := n.state.X + (dx/dist)*passiveFleeRange*2
-	fleeY := n.state.Y + (dy/dist)*passiveFleeRange*2
-	n.moveToward(dt, collMap, fleeX, fleeY, passiveFleeSpeed, 1.0)
+	n.state.Moving = true
+	if n.stepWithSteering(collMap, dx, dy, speed*dt) {
+		n.blockedTime = 0
+	} else {
+		n.blockedTime += dt
+	}
 }
 
 func (n *NPC) updateWander(dt float64, collMap WorldCollider) {

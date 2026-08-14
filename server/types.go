@@ -19,6 +19,13 @@ type PlayerState struct {
 	Mounted   bool    `json:"mounted,omitempty"`
 	HP        int     `json:"hp,omitempty"`
 	MaxHP     int     `json:"maxHp,omitempty"`
+	// VX/VY is the velocity measured for this player last tick, in px/s.
+	// Other clients dead-reckon with it. Inferring it from Dir cannot work:
+	// diagonal movement has two non-zero components but only one facing, so the
+	// prediction pushed remote players along the wrong axis and they were
+	// corrected — visibly — on the next snapshot.
+	VX float64 `json:"vx,omitempty"`
+	VY float64 `json:"vy,omitempty"`
 }
 
 // NPCState is the synchronized state of an NPC.

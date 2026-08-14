@@ -51,7 +51,24 @@ Key flow:
 
 **Platform split:** `network_native.go` (`!js` build tag) uses gorilla/websocket with goroutines; `network_js.go` (WASM) uses `syscall/js` browser WebSocket API. Both produce the same `*Connection` interface defined in `network.go`.
 
-**Client-side interpolation:** Remote entities (`Character.TargetX/Y`) are set from server state; display position (`Character.X/Y`) exponentially decays toward target each frame (`interpK = 20.0`). The local player skips interpolation and moves immediately.
+**Client-side interpolation:** Remote entities (`Character.TargetX/Y`) are set from server state; display position (`Character.X/Y`) exponentially decays toward target each frame (`interpK = 20.0`). The local player skips interpolation and moves immediately. All of this lives in `Character.applyRemoteMotion`, split out so it can be tested without sprites or images (`client/interp_test.go`).
+
+Two rules that both caused visible teleporting when broken:
+
+- **Dead reckoning uses the server-measured velocity** (`PlayerState.VX/VY`,
+  `NPCState.VX/VY`), never a velocity inferred from the facing direction.
+  Inference cannot be right: diagonal movement has two components but one facing,
+  NPC speeds are randomised per NPC, and an entity steering around an obstacle
+  faces where it wants to go. Every mismatch became a visible correction on the
+  next snapshot. Single-tick jumps above `maxTickStep` are reported as zero
+  velocity so real teleports do not make clients predict off-world.
+- **Predicted positions clamp against `activeWorldW/H`**, the size of the world
+  actually loaded, refreshed every frame from `Game.worldSize()`. Using the
+  compile-time `worldW`/`worldH` constants (1120 px) clamped every remote entity
+  on a larger world back to ~1088 px each frame, tripping the `remoteSnapDist`
+  snap and flickering sprites between their real position and the world corner.
+  Refreshing every frame matters: in GMAP mode the real size only arrives after
+  the metadata request completes.
 
 **Cosmetics:** Body/head/hat images are loaded asynchronously in goroutines when filenames change (`SetCosmetics` → sets `cosDirty` → goroutine loads from `Assets/offline/levels/`). Cosmetic state is protected by `Character.cosmu` mutex.
 
@@ -87,8 +104,12 @@ documents the split):
 - **HTTP REST** — `POST /api/register`, `POST /api/login` return a session token
 - **WebSocket hub** — `Hub` manages connected `Client`s under a single `sync.RWMutex`
   that guards `clients`, every `Client.state`/`currentMap`, and every `NPC`
-- **Game loop** — `Hub.runGameLoop()` ticks at 60 Hz: NPC AI, NPC attacks, Lua
-  timers, gralat respawns, then `sendPerClientState()`
+- **Game loop** — `Hub.runGameLoop()` ticks at 60 Hz: **player combat ticks and
+  velocity measurement**, NPC AI, alert propagation, NPC attacks, Lua timers,
+  gralat respawns, then `sendPerClientState()`.
+  Players share `CombatEntity` with NPCs, so their `hitCD` must be ticked here —
+  miss it and a player's invulnerability window never expires, making them
+  permanently immune after the first hit they ever take.
 - **NPC AI** — 15 built-in NPCs (`builtinNPCDefs`) plus Lua- and admin-spawned
   ones. See the behaviour section below.
 - **Map chunk API** — serves `.gmap` metadata and NW chunk data (layers, NPCs, signs, warp links) for the GMAP chunk streaming system
@@ -120,12 +141,49 @@ when the chase ends the NPC walks home rather than settling wherever it stopped.
 - **Leash** (`aggroLeashRange`, or `NPC.leashRange`) caps how far an NPC may be
   dragged from home before it gives up. Without it a player can pull a monster
   across the world and abandon it there.
+- **Who fights**: `NPC.canFight` gates every route into combat. Only guards and
+  monsters qualify — villagers, animals and horses never chase, no matter what
+  happens around them. `NPC.alertGroup` then scopes alerts to one side (monsters
+  rally monsters, guards rally guards, bystanders answer nobody), so a monster
+  shouting cannot recruit the town guard against the player. A guard still fights
+  back when the player hits it directly, via `provoke`.
 - **Alerting**: entering a chase, or taking a hit (`NPC.provoke`), raises an
-  alert. `Hub.propagateAlerts` pulls in allies within `alertRadius` on the same
-  map; passive NPCs never answer. `alertCooldown` stops a long fight from
-  re-alerting every tick. `raisedAlert` is set either by the AI tick or by
-  `damageNPC` between ticks, and `propagateAlerts` is the only place that clears
-  it — do not clear it in `NPC.update`.
+  alert. `Hub.propagateAlerts` pulls in eligible allies within `alertRadius` on
+  the same map. `alertCooldown` stops a long fight from re-alerting every tick.
+  `raisedAlert` is set either by the AI tick or by `damageNPC` between ticks, and
+  `propagateAlerts` is the only place that clears it — do not clear it in
+  `NPC.update`.
+- **Attacking** sets `NPC.attackAnim`, which `syncState` turns into the `sword`
+  anim state so the swing is visible; the server also sends the attacker's name
+  and position in `pvp_damage` so the client can show the damage number and knock
+  the player away from the right place.
+- **Passive flee** uses two thresholds (`passiveFleeRange` to start,
+  `passiveFleeStop` to stop). One threshold made animals oscillate between
+  fleeing and wandering at the boundary, which read as flickering. Fleeing goes
+  through `moveDir` (a direction) not `moveToward` (a destination): a flee target
+  computed from the animal's own position recedes as it moves, so the stall
+  detector never sees progress and shakes the animal in place.
+
+**Obstacle avoidance.** Every step goes through `NPC.stepWithSteering`, which
+tries the direct heading first and then increasing deflections (`steerOffsets`)
+until one is clear. Two rules keep it from degenerating:
+
+- **Exhaust one side before trying the other.** The committed side
+  (`NPC.steerSide`) is tried at *every* offset before the mirror side is
+  considered at all. Interleaving the sides per offset looks natural but makes an
+  NPC walking down the face of an obstacle switch to walking up the moment the
+  downward angle it needs exceeds the upward angle available — it then slides up
+  and down forever instead of rounding the obstacle.
+- **Face where you actually moved**, not where you wanted to, or the sprite walks
+  sideways.
+
+Measured on a wall blocking a straight 800 px path, the detour costs ~13% extra
+distance. This replaced a "push straight, nudge sideways when blocked" scheme
+that made NPCs shuffle against obstacles until they happened to slip past.
+
+Dynamic obstacles (world items) are layered on the static map collision by
+`obstacleCollider`, built per map each tick by `Hub.colliderResolver` — which
+allocates nothing in the common case of no world items.
 
 **Movement invariant — `moveToward` and progress.** All movement goes through
 `NPC.moveToward`, which counts progress as *getting closer to the destination

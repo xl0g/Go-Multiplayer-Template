@@ -241,3 +241,63 @@ func (w *GMapWorld) IsBlocked(x, y, bw, bh float64) bool {
 		w.isPointSolid(x+margin, y+bh-margin) ||
 		w.isPointSolid(x+bw-margin, y+bh-margin)
 }
+
+// ── Dynamic obstacles ─────────────────────────────────────────────────────────
+
+// aabb is an axis-aligned box in world pixels.
+type aabb struct{ x, y, w, h float64 }
+
+func (a aabb) overlaps(x, y, w, h float64) bool {
+	return x < a.x+a.w && x+w > a.x && y < a.y+a.h && y+h > a.y
+}
+
+func (a aabb) contains(x, y float64) bool {
+	return x >= a.x && x < a.x+a.w && y >= a.y && y < a.y+a.h
+}
+
+// worldItemBox is the collision footprint of a world item. Item sprites vary in
+// size and the server never loads them, so this is a deliberate approximation
+// sized to the tile grid rather than to any particular sprite.
+const (
+	worldItemBox   = 24.0
+	worldItemInset = 4.0
+)
+
+// obstacleCollider layers dynamic obstacles on top of the static world
+// collision, so NPC AI treats world items as solid instead of walking through
+// them. A nil base means "no static collision", not "everything is blocked".
+type obstacleCollider struct {
+	base      WorldCollider
+	obstacles []aabb
+}
+
+func (o *obstacleCollider) IsBlocked(x, y, w, h float64) bool {
+	if o.base != nil && o.base.IsBlocked(x, y, w, h) {
+		return true
+	}
+	for _, ob := range o.obstacles {
+		if ob.overlaps(x, y, w, h) {
+			return true
+		}
+	}
+	return false
+}
+
+func (o *obstacleCollider) IsFreePoint(x, y float64) bool {
+	if o.base != nil && !o.base.IsFreePoint(x, y) {
+		return false
+	}
+	for _, ob := range o.obstacles {
+		if ob.contains(x, y) {
+			return false
+		}
+	}
+	return true
+}
+
+func (o *obstacleCollider) Bounds() (float64, float64) {
+	if o.base != nil {
+		return o.base.Bounds()
+	}
+	return mapWidth, mapHeight
+}
