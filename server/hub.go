@@ -21,6 +21,10 @@ type Hub struct {
 	worldColl        WorldCollider
 	worldW, worldH   float64 // cached from worldColl.Bounds(); never changes after init
 
+	// Spawn point built-in content is anchored to (config.json spawnX/spawnY,
+	// or the world centre when unset). Never changes after init.
+	spawnX, spawnY float64
+
 	// World gralat pickups
 	gralats     []*GralatPickup
 	gralatTimer map[string]time.Time    // id → scheduled respawn time
@@ -40,6 +44,53 @@ func mapOrDefault(m string) string {
 		return defaultMap
 	}
 	return m
+}
+
+// builtinNPCDefs describes the NPCs the server always spawns, as offsets from
+// the configured spawn point rather than absolute world coordinates — absolute
+// values only ever made sense for one particular map.
+var builtinNPCDefs = []struct {
+	name    string
+	dx, dy  float64
+	npcType int
+}{
+	// Regular NPCs
+	{"Thibaut the Villager", -180, -120, NPCTypeVillager},
+	{"Marceline the Merchant", 120, -40, NPCTypeMerchant},
+	{"Eleanor the Traveller", -60, 160, NPCTypeTraveler},
+	{"Baptiste the Farmer", 200, 200, NPCTypeFarmer},
+	// Passive animals (flee from players)
+	{"Lapin", -130, 30, NPCTypePassive},
+	{"Biche", 270, 80, NPCTypePassive},
+	{"Poulet", 20, 280, NPCTypePassive},
+	// Aggressive monsters
+	{"Slime Rouge", -280, 380, NPCTypeAggressive},
+	{"Slime Vert", 320, 330, NPCTypeAggressive},
+	{"Gobelin", 70, 480, NPCTypeAggressive},
+	{"Bat", 420, -20, NPCTypeAggressive},
+	// Rideable horses (mount system)
+	{"Épona", 0, 40, NPCTypeHorse},
+	{"Bourrin", 160, 380, NPCTypeHorse},
+}
+
+// resolveSpawn returns the anchor point for built-in content: the configured
+// spawn position, or the centre of the world when the config leaves it at 0,0.
+func (h *Hub) resolveSpawn(cfg serverConfig) (float64, float64) {
+	if cfg.SpawnX != 0 || cfg.SpawnY != 0 {
+		return cfg.SpawnX, cfg.SpawnY
+	}
+	return h.worldW / 2, h.worldH / 2
+}
+
+// placeNear turns a spawn-relative offset into an in-bounds, wall-free world
+// position.
+func (h *Hub) placeNear(dx, dy float64) (float64, float64) {
+	x := clamp(h.spawnX+dx, 0, h.worldW-32)
+	y := clamp(h.spawnY+dy, 0, h.worldH-32)
+	if h.worldColl != nil && !h.worldColl.IsFreePoint(x+8, y+8) {
+		x, y = findFreePos(h.worldColl, x, y, h.worldW, h.worldH)
+	}
+	return x, y
 }
 
 // findNPCOnMap returns the NPC with the given ID if — and only if — it lives on
@@ -63,32 +114,10 @@ func newHub() *Hub {
 		gralatSpawn: make(map[string]GralatPickup),
 	}
 
-	// Load world collision from the same spawn map as the client (config.json → spawnMap).
+	// Load world collision and the spawn point from the same config the client
+	// uses (config.json → spawnMap / spawnX / spawnY).
+	cfg := loadServerConfig("config.json")
 	h.worldColl = loadWorldCollider("config.json")
-
-	npcDefs := []struct {
-		name    string
-		x, y    float64
-		npcType int
-	}{
-		// Regular NPCs
-		{"Thibaut the Villager", 300, 200, NPCTypeVillager},
-		{"Marceline the Merchant", 600, 280, NPCTypeMerchant},
-		{"Eleanor the Traveller", 420, 480, NPCTypeTraveler},
-		{"Baptiste the Farmer", 680, 520, NPCTypeFarmer},
-		// Passive animals (flee from players)
-		{"Lapin", 350, 350, NPCTypePassive},
-		{"Biche", 750, 400, NPCTypePassive},
-		{"Poulet", 500, 600, NPCTypePassive},
-		// Aggressive monsters
-		{"Slime Rouge", 200, 700, NPCTypeAggressive},
-		{"Slime Vert", 800, 650, NPCTypeAggressive},
-		{"Gobelin", 550, 800, NPCTypeAggressive},
-		{"Bat", 900, 300, NPCTypeAggressive},
-		// Rideable horses (mount system)
-		{"Épona", 480, 360, NPCTypeHorse},
-		{"Bourrin", 640, 700, NPCTypeHorse},
-	}
 
 	if h.worldColl != nil {
 		h.worldW, h.worldH = h.worldColl.Bounds()
@@ -96,11 +125,14 @@ func newHub() *Hub {
 		h.worldW, h.worldH = mapWidth, mapHeight
 	}
 
-	for i, def := range npcDefs {
-		x, y := def.x, def.y
-		if h.worldColl != nil && !h.worldColl.IsFreePoint(x+8, y+8) {
-			x, y = findFreePos(h.worldColl, x, y, h.worldW, h.worldH)
-		}
+	// Built-in content is placed relative to the configured spawn point, not at
+	// absolute coordinates. The old absolute values were authored for the
+	// 1120px TMX map; on the configured GMAP world (26624×23552) they landed
+	// ~19000 px from spawn — far outside viewRadius, so no player ever saw them.
+	h.spawnX, h.spawnY = h.resolveSpawn(cfg)
+
+	for i, def := range builtinNPCDefs {
+		x, y := h.placeNear(def.dx, def.dy)
 		n := newNPC(fmt.Sprintf("npc_%d", i), def.name, x, y, def.npcType)
 		n.worldW, n.worldH = h.worldW, h.worldH
 		h.npcs = append(h.npcs, n)
@@ -119,10 +151,7 @@ func newHub() *Hub {
 	// never reappears inside a wall.
 	for i := range gralatSpawnDefs {
 		d := gralatSpawnDefs[i]
-		x, y := d.x, d.y
-		if h.worldColl != nil && !h.worldColl.IsFreePoint(x+8, y+8) {
-			x, y = findFreePos(h.worldColl, x, y, h.worldW, h.worldH)
-		}
+		x, y := h.placeNear(d.dx, d.dy)
 		g := GralatPickup{ID: d.id, X: x, Y: y, Value: d.value, MapID: defaultMap}
 		h.gralatSpawn[d.id] = g
 		gc := g

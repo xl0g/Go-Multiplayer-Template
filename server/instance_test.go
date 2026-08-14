@@ -107,6 +107,47 @@ func TestResolveDefaultMap(t *testing.T) {
 	}
 }
 
+// Built-in content is anchored to the configured spawn point; with no spawn
+// configured it falls back to the world centre.
+func TestResolveSpawnAndPlaceNear(t *testing.T) {
+	h := newTestHub()
+	h.worldW, h.worldH = 26624, 23552
+
+	if x, y := h.resolveSpawn(serverConfig{SpawnX: 15918, SpawnY: 12003}); x != 15918 || y != 12003 {
+		t.Errorf("configured spawn = (%.0f,%.0f), want (15918,12003)", x, y)
+	}
+	if x, y := h.resolveSpawn(serverConfig{}); x != 13312 || y != 11776 {
+		t.Errorf("unset spawn = (%.0f,%.0f), want the world centre (13312,11776)", x, y)
+	}
+
+	// Offsets must land within viewRadius of spawn, or players never see them.
+	h.spawnX, h.spawnY = 15918, 12003
+	for _, def := range builtinNPCDefs {
+		x, y := h.placeNear(def.dx, def.dy)
+		dx, dy := x-h.spawnX, y-h.spawnY
+		if dx*dx+dy*dy > viewRadius*viewRadius {
+			t.Errorf("NPC %q placed %.0f px from spawn, beyond viewRadius %.0f",
+				def.name, dx*dx+dy*dy, viewRadius)
+		}
+	}
+	for _, d := range gralatSpawnDefs {
+		x, y := h.placeNear(d.dx, d.dy)
+		dx, dy := x-h.spawnX, y-h.spawnY
+		if dx*dx+dy*dy > viewRadius*viewRadius {
+			t.Errorf("gralat %q placed beyond viewRadius of spawn", d.id)
+		}
+	}
+
+	// Offsets must stay inside the world even when spawn sits on an edge.
+	h.spawnX, h.spawnY = 0, 0
+	for _, def := range builtinNPCDefs {
+		x, y := h.placeNear(def.dx, def.dy)
+		if x < 0 || y < 0 || x > h.worldW-32 || y > h.worldH-32 {
+			t.Errorf("NPC %q placed out of bounds at (%.0f,%.0f)", def.name, x, y)
+		}
+	}
+}
+
 func TestMapOrDefault(t *testing.T) {
 	if got := mapOrDefault(""); got != defaultMap {
 		t.Errorf("mapOrDefault(%q) = %q, want %q", "", got, defaultMap)

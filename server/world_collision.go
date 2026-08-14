@@ -11,7 +11,18 @@ import (
 
 // serverConfig mirrors the client-side config.json fields the server cares about.
 type serverConfig struct {
-	SpawnMap string `json:"spawnMap"`
+	SpawnMap string  `json:"spawnMap"`
+	SpawnX   float64 `json:"spawnX"`
+	SpawnY   float64 `json:"spawnY"`
+}
+
+// loadServerConfig reads config.json, falling back to compiled-in defaults.
+func loadServerConfig(configPath string) serverConfig {
+	cfg := serverConfig{SpawnMap: "maps/GraalRebornMap.tmx"}
+	if data, err := os.ReadFile(configPath); err == nil {
+		_ = json.Unmarshal(data, &cfg)
+	}
+	return cfg
 }
 
 // resolveDefaultMap derives the default map ID from config.json, using exactly
@@ -24,10 +35,7 @@ type serverConfig struct {
 // unreachable, while the game otherwise looks healthy.
 func resolveDefaultMap(configPath string) string {
 	const fallback = "maps/GraalRebornMap.tmx"
-	cfg := serverConfig{SpawnMap: fallback}
-	if data, err := os.ReadFile(configPath); err == nil {
-		_ = json.Unmarshal(data, &cfg)
-	}
+	cfg := loadServerConfig(configPath)
 	name := strings.TrimSpace(cfg.SpawnMap)
 	if name == "" {
 		return fallback
@@ -60,11 +68,7 @@ func resolveDefaultMap(configPath string) string {
 // loadWorldCollider reads config.json to determine the spawn map type,
 // then returns the appropriate WorldCollider (GMapWorld or CollisionMap).
 func loadWorldCollider(configPath string) WorldCollider {
-	cfg := serverConfig{SpawnMap: "maps/GraalRebornMap.tmx"}
-	if data, err := os.ReadFile(configPath); err == nil {
-		_ = json.Unmarshal(data, &cfg)
-	}
-
+	cfg := loadServerConfig(configPath)
 	spawnMap := cfg.SpawnMap
 	lower := strings.ToLower(spawnMap)
 
