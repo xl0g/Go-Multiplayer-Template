@@ -371,6 +371,25 @@ func (n *NPC) provoke() {
 	n.raiseAlert()
 }
 
+// releaseMount frees a ridden NPC and re-anchors it where it was left.
+//
+// Without the re-anchor the horse keeps its pre-mount home and wander target, so
+// the moment a rider steps off it turns round and treks back to where it was
+// first standing — from the player's side it looks like the horse they parked has
+// a mind of its own. A dismounted mount should graze where it was left.
+func (n *NPC) releaseMount() {
+	n.mountedBy = ""
+	n.state.MountedBy = ""
+	n.homeX, n.homeY = n.state.X, n.state.Y
+	n.targetX, n.targetY = n.state.X, n.state.Y
+	n.timer = 1.0 + mrand.Float64()*2.0
+	n.blockedTime = 0
+	n.bestDist = 0
+	n.steerSide = 0
+	n.state2 = aiNormal
+	n.SetWaypoints(nil) // a patrol route from its old spot is meaningless here
+}
+
 // leash returns the effective leash distance for this NPC.
 func (n *NPC) leash() float64 {
 	if n.leashRange > 0 {

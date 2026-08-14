@@ -204,11 +204,10 @@ func (h *Hub) register(c *Client) {
 func (h *Hub) unregister(c *Client) {
 	h.mu.Lock()
 	delete(h.clients, c)
-	// Free any horse this player was riding
+	// Free any horse this player was riding, leaving it where they left it.
 	for _, n := range h.npcs {
 		if n.mountedBy == c.playerID {
-			n.mountedBy = ""
-			n.state.MountedBy = ""
+			n.releaseMount()
 			break
 		}
 	}
@@ -403,8 +402,7 @@ func (h *Hub) dismountNPC(playerID string) {
 	defer h.mu.Unlock()
 	for _, n := range h.npcs {
 		if n.mountedBy == playerID {
-			n.mountedBy = ""
-			n.state.MountedBy = ""
+			n.releaseMount()
 			return
 		}
 	}

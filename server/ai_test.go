@@ -636,3 +636,42 @@ func TestAlertsStayWithinASide(t *testing.T) {
 		t.Error("a directly provoked guard did not fight back")
 	}
 }
+
+// A dismounted horse must stay where it was left. Keeping its pre-mount home and
+// wander target made it turn round and trek back to where it first stood the
+// instant the rider stepped off.
+func TestDismountedHorseStaysWhereLeft(t *testing.T) {
+	h := newTestHub()
+	horse := newTestNPC("horse", 500, 500, NPCTypeHorse, BehaviourWander)
+	horse.speed = 80
+	h.npcs = []*NPC{horse}
+
+	if !h.mountNPC(horse.state.ID, defaultMap, "player_1") {
+		t.Fatal("could not mount the horse")
+	}
+
+	// Ride it a long way: the rider's move messages drag the horse along.
+	h.mu.Lock()
+	h.updateHorsePos("player_1", 1400, 900)
+	h.mu.Unlock()
+
+	h.dismountNPC("player_1")
+	if horse.mountedBy != "" || horse.state.MountedBy != "" {
+		t.Error("dismount left the horse marked as ridden")
+	}
+	if horse.homeX != 1400 || horse.homeY != 900 {
+		t.Errorf("home stayed at (%.0f,%.0f), want the dismount spot (1400,900)",
+			horse.homeX, horse.homeY)
+	}
+
+	// Let it graze for a while: it must not head back toward its old home.
+	for i := 0; i < 600; i++ {
+		horse.update(1.0/60.0, nil, nil)
+	}
+	if d := distTo(horse, 1400, 900); d > 260 {
+		t.Errorf("horse wandered %.0f px from where it was left — it is going home", d)
+	}
+	if distTo(horse, 500, 500) < 400 {
+		t.Error("horse headed back to its original spot")
+	}
+}
