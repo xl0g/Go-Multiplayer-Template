@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -72,6 +73,16 @@ func (g *Game) handleServerMsg(data []byte) {
 		g.localPlaytime = msg.Playtime
 		g.isAdmin = msg.IsAdmin
 		g.sessionStart = time.Now()
+		// Restore the map instance the player logged out on. The stored X/Y are
+		// only meaningful on that map, so this must happen before the position is
+		// applied — loadGMap/loadMap reposition the character themselves.
+		if msg.Map != "" && msg.Map != g.activeGMap && msg.Map != g.currentMapName {
+			if strings.HasSuffix(strings.ToLower(msg.Map), ".gmap") {
+				g.loadGMap(msg.Map)
+			} else {
+				g.loadMap(msg.Map, false)
+			}
+		}
 		if g.localChar != nil {
 			// Only use the server's stored position when no explicit spawn is configured.
 			if Cfg.SpawnX == 0 && Cfg.SpawnY == 0 {

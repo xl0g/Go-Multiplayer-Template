@@ -14,6 +14,49 @@ type serverConfig struct {
 	SpawnMap string `json:"spawnMap"`
 }
 
+// resolveDefaultMap derives the default map ID from config.json, using exactly
+// the same naming the client announces in its change_map messages
+// (Game.activeGMap for GMAP mode, Game.currentMapName for TMX mode).
+//
+// This has to agree with the client. The server groups every entity with an
+// empty mapID onto this ID, so if it disagrees, all built-in NPCs, gralats and
+// world items end up on a map instance no player is ever on — invisible and
+// unreachable, while the game otherwise looks healthy.
+func resolveDefaultMap(configPath string) string {
+	const fallback = "maps/GraalRebornMap.tmx"
+	cfg := serverConfig{SpawnMap: fallback}
+	if data, err := os.ReadFile(configPath); err == nil {
+		_ = json.Unmarshal(data, &cfg)
+	}
+	name := strings.TrimSpace(cfg.SpawnMap)
+	if name == "" {
+		return fallback
+	}
+
+	// GMAP mode: the client keeps the configured name as-is (appending .gmap if
+	// absent) and announces that.
+	if strings.HasSuffix(strings.ToLower(name), ".gmap") {
+		return name
+	}
+
+	// TMX mode: mirror the client's loadMap() resolution — normalize the suffix,
+	// then probe maps/tmx/ before maps/ for bare filenames.
+	lower := strings.ToLower(name)
+	if strings.HasSuffix(lower, ".nw") {
+		name = name[:len(name)-3] + ".tmx"
+	} else if !strings.HasSuffix(lower, ".tmx") {
+		name += ".tmx"
+	}
+	if !strings.Contains(name, "/") {
+		primary := filepath.Join("maps", "tmx", name)
+		if st, err := os.Stat(primary); err == nil && !st.IsDir() {
+			return primary
+		}
+		return filepath.Join("maps", name)
+	}
+	return name
+}
+
 // loadWorldCollider reads config.json to determine the spawn map type,
 // then returns the appropriate WorldCollider (GMapWorld or CollisionMap).
 func loadWorldCollider(configPath string) WorldCollider {

@@ -76,6 +76,10 @@ func migrate() error {
 		`ALTER TABLE users ADD COLUMN IF NOT EXISTS shield   TEXT DEFAULT ''`,
 		`ALTER TABLE users ADD COLUMN IF NOT EXISTS sword    TEXT DEFAULT ''`,
 		`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin INTEGER DEFAULT 0`,
+		// Which map instance the player was on at logout. Empty = default map.
+		// Without this, last_x/last_y were restored while the map was reset to
+		// the default one, dropping returning players at foreign coordinates.
+		`ALTER TABLE users ADD COLUMN IF NOT EXISTS current_map TEXT DEFAULT ''`,
 		`ALTER TABLE users ADD COLUMN IF NOT EXISTS guild_id BIGINT DEFAULT 0`,
 		`CREATE TABLE IF NOT EXISTS inventory (
 			user_id  BIGINT NOT NULL,
@@ -147,6 +151,8 @@ type UserRecord struct {
 	Hat      string
 	Shield   string
 	Sword    string
+	// CurrentMap is the map instance the player was on at logout ("" = default).
+	CurrentMap string
 }
 
 func CreateUser(username, password, email string) error {
@@ -167,10 +173,12 @@ func Authenticate(username, password string) (*UserRecord, error) {
 	err := conn.QueryRow(
 		`SELECT id, username, password_hash, last_x, last_y, gralats,
 		        COALESCE(playtime,0), COALESCE(body,''), COALESCE(head,''),
-		        COALESCE(hat,''), COALESCE(shield,''), COALESCE(sword,'')
+		        COALESCE(hat,''), COALESCE(shield,''), COALESCE(sword,''),
+		        COALESCE(current_map,'')
 		 FROM users WHERE LOWER(username) = LOWER($1)`, username,
 	).Scan(&u.ID, &u.Name, &hash, &u.LastX, &u.LastY, &u.Gralats,
-		&u.Playtime, &u.Body, &u.Head, &u.Hat, &u.Shield, &u.Sword)
+		&u.Playtime, &u.Body, &u.Head, &u.Hat, &u.Shield, &u.Sword,
+		&u.CurrentMap)
 	if err != nil {
 		return nil, fmt.Errorf("invalid credentials")
 	}
@@ -197,11 +205,13 @@ func ValidateSession(token string) (*UserRecord, error) {
 	err := conn.QueryRow(
 		`SELECT u.id, u.username, u.last_x, u.last_y, u.gralats,
 		        COALESCE(u.playtime,0), COALESCE(u.body,''), COALESCE(u.head,''),
-		        COALESCE(u.hat,''), COALESCE(u.shield,''), COALESCE(u.sword,'')
+		        COALESCE(u.hat,''), COALESCE(u.shield,''), COALESCE(u.sword,''),
+		        COALESCE(u.current_map,'')
 		 FROM sessions s JOIN users u ON s.user_id = u.id
 		 WHERE s.token = $1`, token,
 	).Scan(&u.ID, &u.Name, &u.LastX, &u.LastY, &u.Gralats,
-		&u.Playtime, &u.Body, &u.Head, &u.Hat, &u.Shield, &u.Sword)
+		&u.Playtime, &u.Body, &u.Head, &u.Hat, &u.Shield, &u.Sword,
+		&u.CurrentMap)
 	if err != nil {
 		return nil, fmt.Errorf("invalid session")
 	}
@@ -214,8 +224,12 @@ func SaveCosmetics(userID int64, body, head, hat, shield, sword string) {
 		body, head, hat, shield, sword, userID)
 }
 
-func UpdatePosition(userID int64, x, y float64) {
-	conn.Exec(`UPDATE users SET last_x=$1, last_y=$2 WHERE id=$3`, x, y, userID)
+// UpdatePosition saves the player's logout position together with the map
+// instance those coordinates belong to. Saving one without the other puts the
+// player back at coordinates that mean nothing on the map they are restored to.
+func UpdatePosition(userID int64, x, y float64, currentMap string) {
+	conn.Exec(`UPDATE users SET last_x=$1, last_y=$2, current_map=$3 WHERE id=$4`,
+		x, y, currentMap, userID)
 }
 
 func AddGralats(userID int64, n int) (int, error) {

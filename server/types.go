@@ -42,6 +42,9 @@ type GralatPickup struct {
 	X     float64 `json:"x"`
 	Y     float64 `json:"y"`
 	Value int     `json:"value"` // 1 | 5 | 30 | 100
+	// MapID is the map instance this pickup lives on. Server-side only —
+	// clients only ever receive pickups for the map they are on.
+	MapID string `json:"-"`
 }
 
 // InventoryItem represents a usable item in a player's inventory.
@@ -52,7 +55,8 @@ type InventoryItem struct {
 	Quantity int    `json:"quantity"`
 }
 
-// WorldSpawnItem is an admin-spawned decorative/shop item visible to all players.
+// WorldSpawnItem is an admin-spawned decorative/shop item visible to all players
+// on the same map.
 type WorldSpawnItem struct {
 	ID         string  `json:"id"`
 	Name       string  `json:"name"`
@@ -61,4 +65,8 @@ type WorldSpawnItem struct {
 	Y          float64 `json:"y"`
 	Price      int     `json:"price"`
 	ItemID     string  `json:"item_id,omitempty"`
+	// MapID is the map instance this item lives on (persisted as
+	// world_items.map_name). Server-side only — clients only ever receive
+	// items for the map they are on.
+	MapID string `json:"-"`
 }

@@ -41,6 +41,10 @@ func main() {
 		return
 	}
 
+	// Must run before newHub(): built-in NPCs and gralats are placed on defaultMap.
+	defaultMap = resolveDefaultMap("config.json")
+	log.Printf("[HUB] Default map instance: %s", defaultMap)
+
 	globalHub = newHub()
 	newLuaManager(globalHub)
 	go globalHub.runGameLoop()

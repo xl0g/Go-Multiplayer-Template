@@ -8,6 +8,11 @@ import (
 // respawnDelay is how long after collection before a gralat reappears.
 const respawnDelay = 45 * time.Second
 
+// gralatReach is how far a player may be from a pickup and still collect it.
+// Generous enough to absorb client interpolation and latency, tight enough that
+// a client cannot claim coins it never walked over.
+const gralatReach = 64.0
+
 // gralatSpawnDefs defines the fixed world positions and values of gralat pickups.
 // Positions are in pixels for the 1120×1120 world (70×70 tiles at 16 px each).
 var gralatSpawnDefs = []struct {
