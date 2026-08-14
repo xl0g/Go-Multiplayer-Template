@@ -49,28 +49,34 @@ func mapOrDefault(m string) string {
 // builtinNPCDefs describes the NPCs the server always spawns, as offsets from
 // the configured spawn point rather than absolute world coordinates — absolute
 // values only ever made sense for one particular map.
+// A zero Behaviour value means "use the type's default" (see
+// defaultBehaviourFor); set it explicitly only to override that.
 var builtinNPCDefs = []struct {
-	name    string
-	dx, dy  float64
-	npcType int
+	name      string
+	dx, dy    float64
+	npcType   int
+	behaviour Behaviour
 }{
-	// Regular NPCs
-	{"Thibaut the Villager", -180, -120, NPCTypeVillager},
-	{"Marceline the Merchant", 120, -40, NPCTypeMerchant},
-	{"Eleanor the Traveller", -60, 160, NPCTypeTraveler},
-	{"Baptiste the Farmer", 200, 200, NPCTypeFarmer},
+	// Regular NPCs — mostly wander near their home
+	{"Thibaut the Villager", -180, -120, NPCTypeVillager, BehaviourWander},
+	{"Marceline the Merchant", 120, -40, NPCTypeMerchant, BehaviourStatic},
+	{"Eleanor the Traveller", -60, 160, NPCTypeTraveler, BehaviourRoam},
+	{"Baptiste the Farmer", 200, 200, NPCTypeFarmer, BehaviourWander},
+	// Guards walk a patrol route and join fights when allies call for help
+	{"Garde Renaud", -220, -30, NPCTypeGuard, BehaviourPatrol},
+	{"Garde Solène", 260, -110, NPCTypeGuard, BehaviourPatrol},
 	// Passive animals (flee from players)
-	{"Lapin", -130, 30, NPCTypePassive},
-	{"Biche", 270, 80, NPCTypePassive},
-	{"Poulet", 20, 280, NPCTypePassive},
+	{"Lapin", -130, 30, NPCTypePassive, BehaviourPassive},
+	{"Biche", 270, 80, NPCTypePassive, BehaviourPassive},
+	{"Poulet", 20, 280, NPCTypePassive, BehaviourPassive},
 	// Aggressive monsters
-	{"Slime Rouge", -280, 380, NPCTypeAggressive},
-	{"Slime Vert", 320, 330, NPCTypeAggressive},
-	{"Gobelin", 70, 480, NPCTypeAggressive},
-	{"Bat", 420, -20, NPCTypeAggressive},
+	{"Slime Rouge", -280, 380, NPCTypeAggressive, BehaviourAggressive},
+	{"Slime Vert", 320, 330, NPCTypeAggressive, BehaviourAggressive},
+	{"Gobelin", 70, 480, NPCTypeAggressive, BehaviourAggressive},
+	{"Bat", 420, -20, NPCTypeAggressive, BehaviourRoam}, // roams, then chases once it spots you
 	// Rideable horses (mount system)
-	{"Épona", 0, 40, NPCTypeHorse},
-	{"Bourrin", 160, 380, NPCTypeHorse},
+	{"Épona", 0, 40, NPCTypeHorse, BehaviourWander},
+	{"Bourrin", 160, 380, NPCTypeHorse, BehaviourWander},
 }
 
 // resolveSpawn returns the anchor point for built-in content: the configured
@@ -82,15 +88,35 @@ func (h *Hub) resolveSpawn(cfg serverConfig) (float64, float64) {
 	return h.worldW / 2, h.worldH / 2
 }
 
-// placeNear turns a spawn-relative offset into an in-bounds, wall-free world
-// position.
+// placeNear turns a spawn-relative offset into an in-bounds position whose full
+// NPC bounding box is clear of walls.
 func (h *Hub) placeNear(dx, dy float64) (float64, float64) {
-	x := clamp(h.spawnX+dx, 0, h.worldW-32)
-	y := clamp(h.spawnY+dy, 0, h.worldH-32)
-	if h.worldColl != nil && !h.worldColl.IsFreePoint(x+8, y+8) {
-		x, y = findFreePos(h.worldColl, x, y, h.worldW, h.worldH)
+	return h.freeBoxNear(h.spawnX+dx, h.spawnY+dy)
+}
+
+// freeBoxNear searches outward from (x, y) for a spot where an NPC's 28×28 box
+// fits without overlapping a wall.
+//
+// Testing a single point (IsFreePoint) is not enough: movement checks the whole
+// box, so a point-validated spawn can leave the NPC embedded in a wall with
+// nowhere to step — it then stands still forever, looking like broken AI.
+func (h *Hub) freeBoxNear(x, y float64) (float64, float64) {
+	x = clamp(x, 0, h.worldW-32)
+	y = clamp(y, 0, h.worldH-32)
+	if h.worldColl == nil || !h.worldColl.IsBlocked(x, y, npcW, npcH) {
+		return x, y
 	}
-	return x, y
+	const step = 16.0
+	for radius := step; radius <= 320; radius += step {
+		for a := 0.0; a < 2*math.Pi; a += math.Pi / 12 {
+			nx := clamp(x+math.Cos(a)*radius, 0, h.worldW-32)
+			ny := clamp(y+math.Sin(a)*radius, 0, h.worldH-32)
+			if !h.worldColl.IsBlocked(nx, ny, npcW, npcH) {
+				return nx, ny
+			}
+		}
+	}
+	return x, y // nowhere clear nearby — leave it and let the AI unstick
 }
 
 // findNPCOnMap returns the NPC with the given ID if — and only if — it lives on
@@ -135,6 +161,16 @@ func newHub() *Hub {
 		x, y := h.placeNear(def.dx, def.dy)
 		n := newNPC(fmt.Sprintf("npc_%d", i), def.name, x, y, def.npcType)
 		n.worldW, n.worldH = h.worldW, h.worldH
+		n.SetBehaviour(def.behaviour)
+		if n.behaviour == BehaviourPatrol {
+			// Regenerate the default route with collision awareness: newNPC has no
+			// collider, so its corners can land inside walls.
+			pts := squarePatrol(x, y, patrolDefaultRadius)
+			for j := range pts {
+				pts[j].X, pts[j].Y = h.freeBoxNear(pts[j].X, pts[j].Y)
+			}
+			n.SetWaypoints(pts)
+		}
 		h.npcs = append(h.npcs, n)
 	}
 
@@ -340,6 +376,9 @@ func (h *Hub) damageNPC(npcID, mapID string, dmg int) (newHP int, killed bool) {
 	newHP, killed = n.combat.Damage(dmg)
 	if newHP >= 0 {
 		n.syncState()
+		if !killed {
+			n.provoke() // fight back (or call for help if passive)
+		}
 	}
 	return newHP, killed
 }
@@ -501,6 +540,8 @@ func (h *Hub) runGameLoop() {
 				attacks = append(attacks, npcAttack{playerID: attackedID, mapID: mid})
 			}
 		}
+		h.propagateAlerts()
+
 		// Remove noRespawn NPCs that have died.
 		for i := len(h.npcs) - 1; i >= 0; i-- {
 			n := h.npcs[i]
@@ -547,6 +588,36 @@ func (h *Hub) runGameLoop() {
 		}
 
 		h.sendPerClientState()
+	}
+}
+
+// propagateAlerts pulls nearby allies into a fight when an NPC raises an alert,
+// so a group reacts together instead of one member at a time. Alerts do not
+// cross map instances, and passive NPCs never answer them.
+//
+// This is the only place that clears NPC.raisedAlert: the flag can be set either
+// by an NPC entering a chase or by damageNPC between ticks, and consuming it
+// here means both paths are handled exactly once.
+//
+// O(n²) over NPCs, but only on ticks where an alert actually fired.
+// Caller must hold h.mu write lock.
+func (h *Hub) propagateAlerts() {
+	for _, n := range h.npcs {
+		if !n.raisedAlert {
+			continue
+		}
+		n.raisedAlert = false
+		mid := mapOrDefault(n.mapID)
+		for _, other := range h.npcs {
+			if other == n || mapOrDefault(other.mapID) != mid ||
+				!other.combat.IsAlive() || other.behaviour == BehaviourPassive {
+				continue
+			}
+			dx, dy := other.state.X-n.state.X, other.state.Y-n.state.Y
+			if dx*dx+dy*dy <= alertRadius*alertRadius {
+				other.alertedByAlly = true
+			}
+		}
 	}
 }
 
@@ -631,6 +702,34 @@ func (h *Hub) setLuaNPCDialog(id, msg string, gMin, gMax int) {
 		}
 	}
 	h.mu.Unlock()
+}
+
+// setLuaNPCBehaviour changes an NPC's movement behaviour. Reports whether the
+// NPC was found.
+func (h *Hub) setLuaNPCBehaviour(id string, b Behaviour) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, n := range h.npcs {
+		if n.state.ID == id {
+			n.SetBehaviour(b)
+			return true
+		}
+	}
+	return false
+}
+
+// setLuaNPCWaypoints installs a patrol route on an NPC. Reports whether the NPC
+// was found.
+func (h *Hub) setLuaNPCWaypoints(id string, pts []vec2) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, n := range h.npcs {
+		if n.state.ID == id {
+			n.SetWaypoints(pts)
+			return true
+		}
+	}
+	return false
 }
 
 // getLuaNPCPos returns the current position of an NPC.

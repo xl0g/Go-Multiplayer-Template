@@ -89,15 +89,62 @@ documents the split):
   that guards `clients`, every `Client.state`/`currentMap`, and every `NPC`
 - **Game loop** — `Hub.runGameLoop()` ticks at 60 Hz: NPC AI, NPC attacks, Lua
   timers, gralat respawns, then `sendPerClientState()`
-- **NPC AI** — 13 built-in NPCs (`builtinNPCDefs`) plus Lua- and admin-spawned
-  ones. Types: villager/merchant/guard/traveler/farmer (wander), horse
-  (rideable), passive (flees players), aggressive and spawned-enemy (chase and
-  attack).
+- **NPC AI** — 15 built-in NPCs (`builtinNPCDefs`) plus Lua- and admin-spawned
+  ones. See the behaviour section below.
 - **Map chunk API** — serves `.gmap` metadata and NW chunk data (layers, NPCs, signs, warp links) for the GMAP chunk streaming system
 
 **Interest management:** `sendPerClientState()` sends each client its own
 filtered snapshot rather than broadcasting the whole world — same map instance,
 then within `viewRadius` (2048 px) using the per-tick spatial grid.
+
+### NPC behaviours (`npc.go`)
+
+`NPCType` decides how an NPC looks and what it says; **`Behaviour` decides how it
+moves**. They are separate on purpose — a merchant can patrol and a guard can
+stand still without inventing a type for each combination. `defaultBehaviourFor`
+supplies the historical type→behaviour mapping when none is given.
+
+| Behaviour | Movement |
+|-----------|----------|
+| `BehaviourWander` | short random walk around home (default) |
+| `BehaviourRoam` | wide random walk (`roamRadius`), rarely idle |
+| `BehaviourPatrol` | walks a waypoint loop, pausing at each stop |
+| `BehaviourPassive` | flees the nearest player |
+| `BehaviourAggressive` | chases and attacks |
+| `BehaviourStatic` | never moves |
+
+On top of the behaviour sits a small state machine (`aiState`): `aiNormal` →
+`aiChasing` → `aiReturning` → `aiNormal`. Anything can be pulled into a chase;
+when the chase ends the NPC walks home rather than settling wherever it stopped.
+
+- **Leash** (`aggroLeashRange`, or `NPC.leashRange`) caps how far an NPC may be
+  dragged from home before it gives up. Without it a player can pull a monster
+  across the world and abandon it there.
+- **Alerting**: entering a chase, or taking a hit (`NPC.provoke`), raises an
+  alert. `Hub.propagateAlerts` pulls in allies within `alertRadius` on the same
+  map; passive NPCs never answer. `alertCooldown` stops a long fight from
+  re-alerting every tick. `raisedAlert` is set either by the AI tick or by
+  `damageNPC` between ticks, and `propagateAlerts` is the only place that clears
+  it — do not clear it in `NPC.update`.
+
+**Movement invariant — `moveToward` and progress.** All movement goes through
+`NPC.moveToward`, which counts progress as *getting closer to the destination
+than the NPC has ever been* (`bestDist`), not as "a collision test passed" and
+not as "the position changed". Both weaker definitions silently freeze NPCs:
+
+- with an axis-aligned destination (`dy == 0`, which every `squarePatrol` leg is)
+  the candidate Y equals the current Y, so the Y collision test passes on the
+  position the NPC already occupies;
+- while unsticking, the sideways detour changes the position without getting any
+  nearer, and oscillating along a wall repeatedly re-approaches the target.
+
+Either one resets the stall timers every tick, so no behaviour ever gives up on
+an unreachable destination and the NPC stands still forever while reporting
+`Moving = true`. `blockedTime` accumulates only while there is no new best, and
+each behaviour uses it to re-target (`blockedRetarget*`). Spawn placement has the
+matching rule: use `Hub.freeBoxNear`, which validates the **whole 28×28 box**
+(`npcW`/`npcH`), not a single point — a point-validated spawn can leave an NPC
+embedded in a wall.
 
 ### Map instances (read this before touching any interaction handler)
 
@@ -209,7 +256,9 @@ and runs timers plus queued events.
 
 Bindings (`lua_bindings.go`):
 
-- NPCs — `CreateNPC`, `DeleteNPC`, `SetNPCPosition`, `GetNPCPosition`, `SetNPCDialog`
+- NPCs — `CreateNPC`, `DeleteNPC`, `SetNPCPosition`, `GetNPCPosition`,
+  `SetNPCDialog`, `SetNPCBehaviour(id, "wander"|"roam"|"patrol"|"passive"|"aggressive"|"static")`,
+  `SetNPCWaypoints(id, {{x=..,y=..}, ...})`
 - Players — `GetPlayers`, `GetPlayerName`, `GetPlayerPos`, `GiveGralats`, `TakeGralats`
 - Messaging — `SendMessage`, `BroadcastMessage`, `BroadcastChat`
 - Timers — `SetTimeout`, `SetInterval`, `ClearTimer`
