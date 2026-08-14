@@ -72,6 +72,10 @@ const (
 	// floating-point noise never reads as progress.
 	progressEpsilon = 0.01
 
+	// Displacement in a single tick above which movement is treated as a
+	// teleport rather than velocity (respawn, admin "bring", map placement).
+	maxTickStep = 64.0
+
 	blockedRetargetWander = 0.8
 	blockedRetargetRoam   = 1.5
 	blockedRetargetPatrol = 2.5
@@ -352,9 +356,28 @@ type playerPos struct {
 	alive bool
 }
 
-// update advances the NPC's AI by dt seconds.
+// update advances the NPC's AI by dt seconds and records the velocity it
+// actually achieved, so clients can dead-reckon exactly rather than guessing.
 // Returns a non-empty playerID if this NPC just attacked that player.
 func (n *NPC) update(dt float64, collMap WorldCollider, players []playerPos) (attackedID string) {
+	prevX, prevY := n.state.X, n.state.Y
+	attackedID = n.updateAI(dt, collMap, players)
+
+	if dt > 0 {
+		dx, dy := n.state.X-prevX, n.state.Y-prevY
+		// A large single-tick jump is a teleport (respawn, admin action), not
+		// motion. Reporting it as velocity would have clients predict off-world.
+		if dx*dx+dy*dy > maxTickStep*maxTickStep {
+			n.state.VX, n.state.VY = 0, 0
+		} else {
+			n.state.VX, n.state.VY = dx/dt, dy/dt
+		}
+	}
+	return attackedID
+}
+
+// updateAI runs the behaviour state machine for one tick.
+func (n *NPC) updateAI(dt float64, collMap WorldCollider, players []playerPos) (attackedID string) {
 	// Tick shared combat (cooldowns + respawn).
 	if respawned := n.combat.Tick(dt); respawned {
 		n.state.X = n.homeX

@@ -71,6 +71,12 @@ var npcTints = []color.RGBA{
 
 const interpK = 20.0
 
+// remoteSnapDist is the position error above which a remote entity is snapped
+// rather than smoothed. It should only ever be reached by a genuine teleport
+// (admin action, respawn, map change) — if ordinary movement trips it, dead
+// reckoning is being fed wrong velocities or wrong world bounds.
+const remoteSnapDist = 200.0
+
 // ──────────────────────────────────────────────────────────────
 // Cosmetic image bundle
 // ──────────────────────────────────────────────────────────────
@@ -447,40 +453,7 @@ func (c *Character) Update(dt float64) {
 
 	// Position update for remote entities: dead reckoning + interpolation.
 	if !c.IsLocal {
-		// Advance the authoritative target position by the last known velocity.
-		// This predicts where the player is NOW rather than where they were when
-		// the server snapshot was sent, eliminating most of the network-latency
-		// positional error.
-		if c.Moving {
-			c.TargetX += c.velX * dt
-			c.TargetY += c.velY * dt
-			// Clamp to world bounds
-			if c.TargetX < 0 {
-				c.TargetX = 0
-			}
-			if c.TargetY < 0 {
-				c.TargetY = 0
-			}
-			if c.TargetX > float64(worldW-frameW) {
-				c.TargetX = float64(worldW - frameW)
-			}
-			if c.TargetY > float64(worldH-frameH) {
-				c.TargetY = float64(worldH - frameH)
-			}
-		}
-
-		// Large desync (teleport / map change): snap instantly.
-		dx := c.TargetX - c.X
-		dy := c.TargetY - c.Y
-		if dx*dx+dy*dy > 200*200 {
-			c.X = c.TargetX
-			c.Y = c.TargetY
-		} else {
-			// Exponential smoothing toward predicted target.
-			factor := 1 - math.Exp(-interpK*dt)
-			c.X += dx * factor
-			c.Y += dy * factor
-		}
+		c.applyRemoteMotion(dt)
 	}
 
 	// Determine target gani based on animation state.
@@ -832,4 +805,46 @@ func (c *Character) DrawPreview(dst, offscreen *ebiten.Image, dstX, dstY float64
 func HatThumbRect() image.Rectangle {
 	const hatSz = 48
 	return image.Rect(2*hatSz, 0, 3*hatSz, hatSz) // col 2 = down direction
+}
+
+// applyRemoteMotion advances a remote entity's predicted position by one frame:
+// dead reckoning from the last known velocity, then exponential smoothing of the
+// drawn position toward it.
+//
+// Kept separate from Update so it can be exercised without any of the sprite,
+// gani or image machinery.
+func (c *Character) applyRemoteMotion(dt float64) {
+	// Predict where the entity is NOW rather than where it was when the snapshot
+	// was sent, which removes most of the latency positional error.
+	if c.Moving {
+		c.TargetX += c.velX * dt
+		c.TargetY += c.velY * dt
+
+		// Clamp against the world actually loaded (activeWorldW/H), never the
+		// compile-time TMX constants: on a larger world those would drag every
+		// remote entity back toward the origin every single frame.
+		if c.TargetX < 0 {
+			c.TargetX = 0
+		}
+		if c.TargetY < 0 {
+			c.TargetY = 0
+		}
+		if maxX := activeWorldW - float64(frameW); maxX > 0 && c.TargetX > maxX {
+			c.TargetX = maxX
+		}
+		if maxY := activeWorldH - float64(frameH); maxY > 0 && c.TargetY > maxY {
+			c.TargetY = maxY
+		}
+	}
+
+	dx := c.TargetX - c.X
+	dy := c.TargetY - c.Y
+	if dx*dx+dy*dy > remoteSnapDist*remoteSnapDist {
+		// Genuine teleport (admin action, respawn, map change): snap.
+		c.X, c.Y = c.TargetX, c.TargetY
+		return
+	}
+	factor := 1 - math.Exp(-interpK*dt)
+	c.X += dx * factor
+	c.Y += dy * factor
 }

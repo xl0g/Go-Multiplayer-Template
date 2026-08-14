@@ -28,20 +28,12 @@ func remoteVel(dir int, moving bool, speed float64) (vx, vy float64) {
 	return 0, 0
 }
 
-// npcDeadReckonSpeed returns the dead-reckoning speed for an NPC type.
-// Chasing NPCs (aggressive/spawned) move diagonally toward the player, so
-// cardinal-direction dead-reckoning would overshoot — they use 0 (pure
-// interpolation toward the last known position instead).
-func npcDeadReckonSpeed(npcType int) float64 {
-	switch npcType {
-	case NPCTypeSpawnedEnemy, NPCTypeAggressive:
-		return 0 // pure interpolation: no cardinal-direction prediction
-	case NPCTypePassive:
-		return 120.0
-	default:
-		return 95.0
-	}
-}
+// NPC dead reckoning no longer guesses a speed per type: the server sends the
+// velocity it actually measured in NPCState.VX/VY. The old per-type guess is
+// gone because it could not be right — NPC speeds are randomised per NPC, they
+// move diagonally, and a wall-sliding NPC faces a direction it is not moving in.
+// remoteVel above is still used for remote players, whose speed comes from the
+// shared config.
 
 // ──────────────────────────────────────────────────────────────
 // Network message processing
@@ -225,13 +217,16 @@ func (g *Game) handleServerMsg(data []byte) {
 		seenNPC := make(map[string]bool)
 		for _, n := range msg.NPCs {
 			seenNPC[n.ID] = true
-			drSpeed := npcDeadReckonSpeed(n.NPCType)
 			if ch, ok := g.npcs[n.ID]; ok {
 				ch.missedTicks = 0
 				ch.TargetX, ch.TargetY = n.X, n.Y
 				ch.Dir = n.Dir
 				ch.Moving = n.Moving
-				ch.velX, ch.velY = remoteVel(n.Dir, n.Moving, drSpeed)
+				// Use the server-measured velocity rather than inferring one from
+				// Dir: NPCs move diagonally at randomised speeds, and an NPC
+				// sliding along a wall faces the direction it is trying to go, not
+				// the one it is actually moving in.
+				ch.velX, ch.velY = n.VX, n.VY
 				ch.HP = n.HP
 				ch.MaxHP = n.MaxHP
 				if n.AnimState == "dead" && ch.AnimState != AnimDead {
@@ -246,7 +241,7 @@ func (g *Game) handleServerMsg(data []byte) {
 				if n.AnimState == "dead" {
 					ch.AnimState = AnimDead
 				}
-				ch.velX, ch.velY = remoteVel(n.Dir, n.Moving, drSpeed)
+				ch.velX, ch.velY = n.VX, n.VY
 				g.npcs[n.ID] = ch
 			}
 		}

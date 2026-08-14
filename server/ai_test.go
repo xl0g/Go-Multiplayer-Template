@@ -395,3 +395,53 @@ func TestUnstickCommitsToADirection(t *testing.T) {
 		t.Errorf("detour angle changed mid-detour: %.3f → %.3f", angle, n.stuckAngle)
 	}
 }
+
+// The server reports the velocity an NPC actually achieved, because the client
+// dead-reckons with it. A guess based on facing direction cannot be right: NPCs
+// move diagonally at randomised speeds.
+func TestNPCReportsMeasuredVelocity(t *testing.T) {
+	n := newTestNPC("walker", 500, 500, NPCTypeVillager, BehaviourWander)
+	n.speed = 120
+	n.targetX, n.targetY = 900, 900 // diagonal, so both axes are non-zero
+	n.timer = 99                    // do not re-target mid-test
+
+	const dt = 1.0 / 60.0
+	beforeX, beforeY := n.state.X, n.state.Y
+	n.update(dt, nil, nil)
+
+	wantVX := (n.state.X - beforeX) / dt
+	wantVY := (n.state.Y - beforeY) / dt
+	if math.Abs(n.state.VX-wantVX) > 1e-6 || math.Abs(n.state.VY-wantVY) > 1e-6 {
+		t.Errorf("reported velocity (%.3f,%.3f), actual (%.3f,%.3f)",
+			n.state.VX, n.state.VY, wantVX, wantVY)
+	}
+	if n.state.VX <= 0 || n.state.VY <= 0 {
+		t.Errorf("expected movement on both axes, got (%.3f,%.3f)", n.state.VX, n.state.VY)
+	}
+	// Magnitude must match the configured speed, which is what a per-type guess
+	// would have got wrong.
+	if got := math.Hypot(n.state.VX, n.state.VY); math.Abs(got-n.speed) > 1.0 {
+		t.Errorf("velocity magnitude %.1f px/s, want ~%.1f", got, n.speed)
+	}
+}
+
+// A teleport must report zero velocity, or clients would predict off-world.
+func TestTeleportReportsZeroVelocity(t *testing.T) {
+	n := newTestNPC("mob", 500, 500, NPCTypeAggressive, BehaviourAggressive)
+	n.combat.HP = 1
+	n.combat.noRespawn = false
+	// Kill it, then run the respawn timer out: respawn snaps it back home from
+	// wherever it died.
+	n.state.X, n.state.Y = 3000, 3000
+	n.combat.Damage(1)
+	for i := 0; i < 60*(int(npcRespawnTime)+1); i++ {
+		n.update(1.0/60.0, nil, nil)
+	}
+	if n.state.X != n.homeX || n.state.Y != n.homeY {
+		t.Fatalf("NPC did not respawn home: (%.0f,%.0f) vs (%.0f,%.0f)",
+			n.state.X, n.state.Y, n.homeX, n.homeY)
+	}
+	if n.state.VX != 0 || n.state.VY != 0 {
+		t.Errorf("respawn reported velocity (%.1f,%.1f), want (0,0)", n.state.VX, n.state.VY)
+	}
+}

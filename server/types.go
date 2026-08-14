@@ -34,6 +34,12 @@ type NPCState struct {
 	MaxHP     int     `json:"maxHp"`
 	MountedBy string  `json:"mountedBy,omitempty"`
 	AnimState string  `json:"anim,omitempty"`
+	// VX/VY is the velocity the NPC actually achieved last tick, in px/s.
+	// Clients dead-reckon with it instead of guessing from Dir and a per-type
+	// speed: NPCs move diagonally at randomised speeds, so any guess drifts from
+	// the authoritative position and gets visibly snapped back every update.
+	VX float64 `json:"vx,omitempty"`
+	VY float64 `json:"vy,omitempty"`
 }
 
 // GralatPickup is a collectable coin in the world.

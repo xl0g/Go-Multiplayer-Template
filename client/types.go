@@ -34,6 +34,10 @@ type NPCState struct {
 	MaxHP     int     `json:"maxHp"`
 	MountedBy string  `json:"mountedBy,omitempty"`
 	AnimState string  `json:"anim,omitempty"`
+	// VX/VY is the velocity the server measured for this NPC last tick, in px/s.
+	// Used directly for dead reckoning — see the note in server/types.go.
+	VX float64 `json:"vx,omitempty"`
+	VY float64 `json:"vy,omitempty"`
 }
 
 // GralatPickup is a collectable gralat coin in the world.
