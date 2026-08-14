@@ -32,6 +32,12 @@ type Hub struct {
 
 	// Admin-spawned world items (persisted in world_items table)
 	worldItems []*WorldSpawnItem
+
+	// Game-loop instrumentation for the admin debug panel. Both are written from
+	// the loop under h.mu, so the observed tick rate reflects real work done
+	// rather than the ticker's nominal rate.
+	tickCount uint64
+	startedAt time.Time
 }
 
 var globalHub *Hub
@@ -516,6 +522,10 @@ func (h *Hub) runGameLoop() {
 		}
 
 		h.mu.Lock()
+		h.tickCount++
+		if h.startedAt.IsZero() {
+			h.startedAt = now
+		}
 		// Build player snapshots per map for NPC AI.
 		playersByMap := make(map[string][]playerPos, 4)
 		for c := range h.clients {

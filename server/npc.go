@@ -155,6 +155,17 @@ const (
 	aiReturning
 )
 
+func (s aiState) String() string {
+	switch s {
+	case aiChasing:
+		return "chasing"
+	case aiReturning:
+		return "returning"
+	default:
+		return "normal"
+	}
+}
+
 // vec2 is a world-space point.
 type vec2 struct{ X, Y float64 }
 

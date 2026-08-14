@@ -352,13 +352,36 @@ Sprite sheet `Assets/offline/levels/images/downloads/gralats.png` is 64×64 (2×
 
 `PanelMenu` is the icon strip at the top of screen (Maps, News, Shop, Friends, Guilds, Quests, Settings…). Clicking an icon opens the corresponding sub-panel or action.
 
-### Admin Menu (`admin.go`)
+### Admin / Debug Panel (`client/admin.go` + `server/admin_debug.go`)
 
-Accessible via `Tab` key for admin accounts only (`g.isAdmin`). Lets admins:
-- Spawn world items (name, sprite path, item id, price) at the local player's position.
-- Remove existing world items by id (shown in a list synced from server).
+`Tab` opens a four-tab panel for admins (`users.is_admin`). It is **modal for the
+keyboard**: `game_input.go` returns early while it is open, because its shortcuts
+overlap gameplay keys (P, F, R, T, …) and the arrows would otherwise walk the
+player. `Esc` first leaves a focused text field, then closes.
 
-Signals `SpawnReq` / `RemoveID` are set on the struct and consumed by `game.go` each frame.
+| Tab | Contents |
+|-----|----------|
+| `1 SERVER` | map instance (own vs default), world size, spawn anchor, collision loaded, observed game-loop Hz, uptime, entity counts, running Lua resources |
+| `2 NPCS` | every NPC on your map with behaviour, AI state, HP, distance and `blocked` timer; `↑↓` select, `B` cycle behaviour, `K` kill, `V` revive, `P` provoke, `G` bring here, `H` send home, `T` teleport to it |
+| `3 PLAYER` | teleport by coordinates or to spawn, kill / full heal, give or remove gralats, spawn 1 or 5 aggressive enemies |
+| `4 ITEMS` | the world-item spawn form and the list of items on your map |
+
+The panel queues whole messages in `AdminMenu.Out`, which `game_input.go` drains
+and sends — the menu never touches the connection. Server handlers all start with
+`requireAdmin`. Two fields worth knowing when reading the NPCS tab: `AI` shows the
+`aiState` (`normal` / `chasing` / `returning`) and `BLK` is `blockedTime`, which
+turns orange past 1 s and means the NPC cannot reach its destination.
+
+Protocol (all admin-gated): C→S `admin_debug_info`, `admin_npc_list`,
+`admin_npc_behaviour`, `admin_npc_action` (`kill`/`revive`/`provoke`/`bring`/`home`),
+`admin_teleport`, `admin_gralats`, `admin_set_hp`, `admin_spawn_enemy`;
+S→C `debug_info`, `npc_debug_list` (keyed `debugNpcs`, **not** `npcs`, which
+already carries `[]NPCState`), `teleport_ok`.
+
+World items still use the older signal pattern rather than the `Out` queue:
+`SpawnReq` / `RemoveID` are set on the struct and consumed by `game_input.go`,
+because the spawn position has to be filled in from `localChar` before sending.
+Items spawn on the admin's **current map**, persisted in `world_items.map_name`.
 
 ### Emoji / Emoticons (`emoji.go`)
 
@@ -390,7 +413,7 @@ When a player sends chat text matching a shortcode (`:)`, `:(`, etc.) an emotico
 | `P` | Toggle profile panel (gralat count) |
 | `T` | Open chat |
 | `C` | Open cosmetic picker |
-| `Tab` | Toggle admin menu (admin only) |
+| `Tab` | Toggle admin / debug panel (admin only; modal for the keyboard) |
 | `F3` | Toggle debug overlay |
 | Mouse wheel | Camera zoom in/out |
 | `Esc` | Close dialog / close panel / back to menu |

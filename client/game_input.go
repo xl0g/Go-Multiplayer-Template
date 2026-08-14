@@ -183,6 +183,31 @@ func (g *Game) updatePlaying(dt float64) error {
 				})
 			}
 		}
+		// Drain the debug panel's request queue. It builds whole messages itself,
+		// so nothing here needs to know what each one means.
+		if len(g.adminMenu.Out) > 0 {
+			if g.conn != nil {
+				for _, msg := range g.adminMenu.Out {
+					g.conn.SendJSON(msg)
+				}
+			}
+			g.adminMenu.Out = g.adminMenu.Out[:0]
+		}
+
+		// The debug panel is modal for the keyboard. Its shortcuts (B/K/V/P/G/H/
+		// T/S/F/E/M/R and the arrows) overlap gameplay keys, so returning here
+		// stops the game from also toggling the profile, mounting, swinging the
+		// sword or walking the player around while the panel is open.
+		if inpututil.IsKeyJustPressed(ebiten.KeyEscape) {
+			if g.adminMenu.HasFocus() {
+				g.adminMenu.blurAll() // first Esc leaves the text field
+			} else {
+				g.adminMenu.Close()
+			}
+		} else if inpututil.IsKeyJustPressed(ebiten.KeyTab) && !g.adminMenu.HasFocus() {
+			g.adminMenu.Close()
+		}
+		return nil
 	}
 
 	// Escape: close overlays in order.

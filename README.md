@@ -63,7 +63,7 @@ Open **http://localhost:8080** in your browser.
 | `WASD` / Arrows | Move |
 | `X` | Sword swing |
 | `Q` | Grab |
-| `TAB` | Open Admin Menu |
+| `TAB` | Open Admin / Debug panel (admin accounts only) |
 | `R` | Mount / dismount horse |
 | `F` | Interact with sign or NPC / close dialog |
 | `T` | Open chat |

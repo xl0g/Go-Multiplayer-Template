@@ -225,6 +225,23 @@ func handleWebSocket(w http.ResponseWriter, r *http.Request) {
 			handleAdminSpawnWorldItem(client, raw)
 		case "admin_remove_world_item":
 			handleAdminRemoveWorldItem(client, raw)
+		// ── Admin debug panel ─────────────────────────────────
+		case "admin_debug_info":
+			handleAdminDebugInfo(client)
+		case "admin_npc_list":
+			handleAdminNPCList(client)
+		case "admin_npc_behaviour":
+			handleAdminSetNPCBehaviour(client, raw)
+		case "admin_npc_action":
+			handleAdminNPCAction(client, raw)
+		case "admin_teleport":
+			handleAdminTeleport(client, raw)
+		case "admin_gralats":
+			handleAdminSetGralats(client, raw)
+		case "admin_set_hp":
+			handleAdminSetHP(client, raw)
+		case "admin_spawn_enemy":
+			handleAdminSpawnEnemyMsg(client, raw)
 		// ── Friends ───────────────────────────────────────────
 		case "friend_add":
 			handleFriendAdd(client, raw)

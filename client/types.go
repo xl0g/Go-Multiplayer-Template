@@ -153,9 +153,56 @@ type ServerMessage struct {
 	Guilds     []GuildListEntry `json:"guilds,omitempty"`
 	GuildID    int64            `json:"guild_id,omitempty"`
 
+	// Admin debug panel
+	DebugInfo *ServerDebugInfo `json:"info,omitempty"`
+	DebugNPCs []NPCDebugInfo   `json:"debugNpcs,omitempty"`
+
 	// Quests
 	Quests   []QuestEntry `json:"quests,omitempty"`
 	QuestID  string       `json:"quest_id,omitempty"`
 	Progress int          `json:"progress,omitempty"`
 	Required int          `json:"required,omitempty"`
+}
+
+// ── Admin debug payloads (mirror server/admin_debug.go) ──────────────────────
+
+// ServerDebugInfo is server-wide state shown in the admin debug panel.
+type ServerDebugInfo struct {
+	Players        int      `json:"players"`
+	NPCs           int      `json:"npcs"`
+	Gralats        int      `json:"gralats"`
+	WorldItems     int      `json:"worldItems"`
+	DefaultMap     string   `json:"defaultMap"`
+	MyMap          string   `json:"myMap"`
+	WorldW         float64  `json:"worldW"`
+	WorldH         float64  `json:"worldH"`
+	SpawnX         float64  `json:"spawnX"`
+	SpawnY         float64  `json:"spawnY"`
+	HasCollision   bool     `json:"hasCollision"`
+	UptimeSec      int      `json:"uptimeSec"`
+	ObservedHz     float64  `json:"observedHz"`
+	LuaResources   []string `json:"luaResources"`
+	ViewRadius     float64  `json:"viewRadius"`
+	PlayersOnMyMap int      `json:"playersOnMyMap"`
+}
+
+// NPCDebugInfo carries the AI internals of one NPC, which the normal state
+// broadcast does not include.
+type NPCDebugInfo struct {
+	ID        string  `json:"id"`
+	Name      string  `json:"name"`
+	NPCType   int     `json:"npcType"`
+	Behaviour string  `json:"behaviour"`
+	AIState   string  `json:"aiState"`
+	X         float64 `json:"x"`
+	Y         float64 `json:"y"`
+	HP        int     `json:"hp"`
+	MaxHP     int     `json:"maxHp"`
+	Alive     bool    `json:"alive"`
+	MapID     string  `json:"mapId"`
+	Aggro     string  `json:"aggro"`
+	Blocked   float64 `json:"blocked"`
+	Waypoints int     `json:"waypoints"`
+	MountedBy string  `json:"mountedBy"`
+	Dist      float64 `json:"dist"`
 }

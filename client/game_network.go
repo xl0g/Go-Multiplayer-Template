@@ -294,6 +294,21 @@ func (g *Game) handleServerMsg(data []byte) {
 	case "gralat_update":
 		g.localGralats = msg.GralatN
 
+	// ── Admin debug panel ──
+	case "debug_info":
+		g.adminMenu.SetDebugInfo(msg.DebugInfo)
+
+	case "npc_debug_list":
+		g.adminMenu.SetNPCDebug(msg.DebugNPCs)
+
+	case "teleport_ok":
+		// The client owns movement, so it must adopt the server's position
+		// explicitly rather than waiting for a state snapshot to correct it.
+		if g.localChar != nil {
+			g.localChar.X, g.localChar.Y = msg.X, msg.Y
+			g.localChar.TargetX, g.localChar.TargetY = msg.X, msg.Y
+		}
+
 	case "npc_dialog":
 		g.npcDialog = msg.Msg
 		g.npcGralatN = msg.GralatN
